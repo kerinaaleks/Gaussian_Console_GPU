@@ -5,6 +5,7 @@
 #include <clocale>
 #include <algorithm>
 #include <fstream>
+#include <chrono>
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -58,23 +59,25 @@ __global__ void FindLeadingOneKernel(const uint8_t* __restrict__  rows, int* __r
 	}
 }
 
-int ComputePivotGPU(uint8_t* frameBuffer, int frameLength) {
-	uint8_t* d_row;
-	cudaMalloc(&d_row, frameLength);
-	cudaMemcpy(d_row, frameBuffer, frameLength, cudaMemcpyHostToDevice);
+__global__ void XorRowsKernel(
+	uint8_t* d_fastRows,
+	uint8_t* d_cache,
+	uint8_t* d_matrix,
+	int frameLength,
+	int srcIndex, // Индекс строки, которую нужно изменить
+	bool fromCache,
+	int targetRow // Индекс строки матрицы с которой XOR‑им
+) {
 
-	int*d_pivot;
-	cudaMalloc(&d_pivot, sizeof(int));
+	int tid = threadIdx.x + blockIdx.x * blockDim.x; // нормер байта строки, который должен обрботать этот поток
 
-	FindLeadingOneKernel << <1, 32 >> > (d_row, d_pivot, frameLength, 1);
+	if (tid >= frameLength) // Проверка выхода за границы
+		return;
 
-	int pivot;
-	cudaMemcpy(&pivot, d_pivot, sizeof(int), cudaMemcpyDeviceToHost);
+	uint8_t* src = fromCache ? (d_cache + srcIndex * frameLength) : (d_fastRows + srcIndex * frameLength); // строка пришла из кэша или из рама?
+	uint8_t* target = d_matrix + targetRow * frameLength; // Выбор строки матрицы
 
-	cudaFree(d_row);
-	cudaFree(d_pivot);
-
-	return pivot;
+	src[tid] ^= target[tid];
 }
 
 bool GetBit(const uint8_t* data, size_t bitIndex) {
@@ -105,7 +108,6 @@ void ReverseGear(uint8_t** matrix, size_t matrixRows, size_t codeLength, size_t 
 	}
 }
 
-///////////////////////////////////////////////////////ВОТ ЕЕ ДОПИСАЛА В ПТ
 void ReadCodeWords(ifstream& file, size_t cwIndex, size_t codeLength, uint8_t* dst) {
 	// Номер бита во всем файле с которого начинается это слово
 	size_t bitStart = cwIndex * codeLength; // номер кодового слова * длина одного кодового слова в битах
@@ -137,8 +139,13 @@ void ReadCodeWords(ifstream& file, size_t cwIndex, size_t codeLength, uint8_t* d
 	}
 	delete[] buf;
 }
-////////////////////////////////////////////////////////////////////////////////////////
-bool ProcessFrame(
+
+bool ProcessFrameGPU(
+	int srcIndex,
+	bool fromCache,
+	uint8_t* d_fastRows,
+	uint8_t* d_cache,
+	uint8_t* d_matrix,
 	uint8_t* frameBuffer,
 	uint8_t** matrix,
 	uint8_t** cache,
@@ -147,65 +154,70 @@ bool ProcessFrame(
 	size_t& matrixRows,
 	size_t& cacheRows,
 	int rowIndex,
-	size_t infoLength,
 	size_t wordsCount,
-	int pivot,           // текущий pivot этой строки
-	int* cwIndexFast,     // pivot'ы строк в RAM
-	int* cwIndexCache,    // pivot'ы строк в cache
-	int* pivotsMatrix     // pivot'ы строк итоговой матрицы
+	int pivot, // текущий pivot этой строки
+	int* cwIndexFast, // pivot'ы строк в RAM
+	int* cwIndexCache, // pivot'ы строк в cache
+	int* pivotsMatrix // pivot'ы строк итоговой матрицы
 )
 {
 	if (pivot == -1)
 		return false;
 
-	// 1. pivot == rowIndex → строка идёт в матрицу
-	if (pivot == rowIndex) {
-		memcpy(matrix[rowIndex], frameBuffer, frameLength);
-		pivotsMatrix[rowIndex] = pivot;
-		matrixRows++;
-		return true;
-	}
-
-	// 2. pivot < rowIndex → пытаемся привести XOR по строке с таким же pivot
-	if (pivot < rowIndex) {
-		int target_row = -1;
-		for (size_t r = 0; r < matrixRows; ++r) {
-			if (pivotsMatrix[r] == pivot) {
-				target_row = (int)r;
-				break;
-			}
+	while (true)
+	{
+		// 1. pivot == rowIndex → строка идёт в матрицу
+		if (pivot == rowIndex) {
+			memcpy(matrix[rowIndex], frameBuffer, frameLength);
+			cudaMemcpy(d_matrix + rowIndex * frameLength, frameBuffer, frameLength, cudaMemcpyHostToDevice);
+			pivotsMatrix[rowIndex] = pivot;
+			matrixRows++;
+			return true;
 		}
 
-		if (target_row == -1)
-			return false; // нет строки с таким pivot в матрице
+		// 2. pivot < rowIndex → XOR
+		if (pivot < rowIndex) {
+			int target_row = -1;
+			for (size_t r = 0; r < matrixRows; ++r) {
+				if (pivotsMatrix[r] == pivot) {
+					target_row = (int)r;
+					break;
+				}
+			}
 
-		// XOR с найденной строкой
-		for (size_t j = 0; j < frameLength; ++j)
-			frameBuffer[j] ^= matrix[target_row][j];
+			if (target_row == -1) // нет строки с таким pivot в матрице
+				return false;
 
-		// пересчитываем pivot этой строки (CPU)
-		//pivot = FindLeadingOne(frameBuffer, codeLength);
-		pivot = ComputePivotGPU(frameBuffer, codeLength);
-		if (pivot == -1)
-			return false;
+			int threadsPerBlock = 256;
+			int blocks = (int)((frameLength + threadsPerBlock - 1) / threadsPerBlock);
 
-		// рекурсивно пробуем ещё раз с новым pivot
-		return ProcessFrame(frameBuffer, matrix, cache,
-			codeLength, frameLength,
-			matrixRows, cacheRows,
-			rowIndex, infoLength, wordsCount,
-			pivot, cwIndexFast, cwIndexCache, pivotsMatrix);
+			XorRowsKernel << <blocks, threadsPerBlock >> > (
+				d_fastRows, d_cache, d_matrix, (int)frameLength, srcIndex, fromCache, target_row);
+			cudaDeviceSynchronize();
+
+			cudaMemcpy(
+				frameBuffer,
+				(fromCache ? d_cache : d_fastRows) + srcIndex * frameLength,
+				frameLength, cudaMemcpyDeviceToHost
+			);
+
+			pivot = FindLeadingOne(frameBuffer, codeLength);
+			if (pivot == -1)
+				return false;
+
+			continue;//проверяем снова эту же строку, но уже измененный ее вид
+		}
+
+		// 3. pivot > rowIndex → кладём строку в кэш
+		if (cacheRows < wordsCount) {
+			cache[cacheRows] = new uint8_t[frameLength];
+			memcpy(cache[cacheRows], frameBuffer, frameLength);
+			cwIndexCache[cacheRows] = pivot;
+			cacheRows++;
+		}
+
+		return false;
 	}
-
-	// 3. pivot > rowIndex → кладём строку в кэш
-	if (cacheRows < wordsCount) {
-		cache[cacheRows] = new uint8_t[frameLength];
-		memcpy(cache[cacheRows], frameBuffer, frameLength);
-		cwIndexCache[cacheRows] = pivot;   // запоминаем pivot строки в кэше
-		cacheRows++;
-	}
-
-	return false;
 }
 
 void ProcessAllFrame(
@@ -213,26 +225,27 @@ void ProcessAllFrame(
 	uint8_t** cache,
 	uint8_t** fastRows,
 	uint8_t* frameBuffer,
+	uint8_t* d_fastRows,
+	uint8_t* d_cache,
+	uint8_t* d_matrix,
 	size_t wordsCount,
 	size_t codeLength,
 	size_t frameLength,
 	size_t& matrixRows,
 	size_t& cacheRows,
 	size_t infoLength,
-	int* cwIndexFast,    // pivot'ы строк в RAM
-	int* cwIndexCache,   // pivot'ы строк в cache
-	int* pivotsMatrix    // pivot'ы строк итоговой матрицы
-)
+	int* cwIndexFast,
+	int* cwIndexCache,
+	int* pivotsMatrix)
 {
 	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
 		cout << "итерация: " << rowIndex << endl;
 		bool found = false;
 
-		// 1. Сначала ищем строку в RAM
+		// Сначала ищем строку в RAM
 		for (size_t i = 0; i < wordsCount && !found; ++i) {
 			if (cwIndexFast[i] == -1)
 				continue; // строки нет (пустая или уже использована)
-
 			// проверяем, что строка не нулевая
 			bool isZero = true;
 			for (size_t b = 0; b < frameLength; ++b) {
@@ -249,10 +262,11 @@ void ProcessAllFrame(
 			memcpy(frameBuffer, fastRows[i], frameLength);
 			int pivot = cwIndexFast[i];
 
-			if (ProcessFrame(frameBuffer, matrix, cache, codeLength, frameLength, matrixRows, cacheRows, rowIndex, infoLength, wordsCount, pivot, cwIndexFast, cwIndexCache, pivotsMatrix))
+			if (ProcessFrameGPU(
+				(int)i,
+				false, d_fastRows, d_cache, d_matrix, frameBuffer, matrix, cache, codeLength, frameLength, matrixRows, cacheRows, rowIndex, wordsCount, pivot, cwIndexFast, cwIndexCache, pivotsMatrix))
 			{
 				found = true;
-
 				// строка RAM ушла в матрицу → очищаем её
 				memset(fastRows[i], 0, frameLength);
 				cwIndexFast[i] = -1;
@@ -276,12 +290,10 @@ void ProcessAllFrame(
 						continue;
 					}
 
-					// перенос строки из cache[j] в fastRows[i]
 					memcpy(fastRows[i], cache[j], frameLength);
 					cwIndexFast[i] = cwIndexCache[j];
 
 					delete[] cache[j];
-
 					// сдвиг кэша и индексов
 					for (size_t k = j + 1; k < cacheRows; ++k) {
 						cache[k - 1] = cache[k];
@@ -297,7 +309,7 @@ void ProcessAllFrame(
 			}
 		}
 
-		// 2. Если RAM не дала строку → ищем в кэше
+		// Если RAM не дала строку → ищем в кэше
 		if (!found) {
 			for (size_t i = 0; i < cacheRows; ++i) {
 				if (cache[i] == nullptr || cwIndexCache[i] == -1)
@@ -306,14 +318,27 @@ void ProcessAllFrame(
 				memcpy(frameBuffer, cache[i], frameLength);
 				int pivot = cwIndexCache[i];
 
-				if (ProcessFrame(frameBuffer, matrix, cache,
-					codeLength, frameLength,
-					matrixRows, cacheRows,
-					rowIndex, infoLength, wordsCount,
-					pivot, cwIndexFast, cwIndexCache, pivotsMatrix))
+				if (ProcessFrameGPU(
+					(int)i,
+					true,
+					d_fastRows,
+					d_cache,
+					d_matrix,
+					frameBuffer,
+					matrix,
+					cache,
+					codeLength,
+					frameLength,
+					matrixRows,
+					cacheRows,
+					rowIndex,
+					wordsCount,
+					pivot,
+					cwIndexFast,
+					cwIndexCache,
+					pivotsMatrix))
 				{
 					delete[] cache[i];
-
 					// сдвигаем кэш и индексы
 					for (size_t j = i + 1; j < cacheRows; ++j) {
 						cache[j - 1] = cache[j];
@@ -330,16 +355,16 @@ void ProcessAllFrame(
 			}
 		}
 
-		// 3. Если ни RAM, ни кэш не дали строку → нулевая строка
+		// Если ни RAM, ни кэш не дали строку → нулевая строка
 		if (!found) {
 			memset(matrix[rowIndex], 0, frameLength);
 			pivotsMatrix[rowIndex] = -1;
 			matrixRows++;
 		}
 	}
+
 	ReverseGear(matrix, infoLength, codeLength, frameLength);
 }
-
 //////////////////////////////////////////////////////////////////////
 void PrintMatrix(uint8_t** matrix, size_t matrixRows, size_t codeLength) {
 	cout << "Матрица после метода Гаусса\n\n";
@@ -370,31 +395,25 @@ int main()
 {
 	setlocale(LC_ALL, "");
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.17.bin)";
-	string Type = "bin";
-	size_t FileBitLength = 940928; // Беззнаковый целочисленный типа(8 байт для 64 битных систем)
-	size_t FirstBit = 0;
-	string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)"; //папка куда запишем выходной файл
-	size_t codeLength = 2064;//длина кодового слова
-	size_t infoLength = 2000;//длина инфомрационной части КС
+	auto start = chrono::high_resolution_clock::now();
 
-	// массив для конечной матрицы со смещением
-	size_t frameLength = (codeLength + 7) / 8; // Вычисляем сколько нужно выделить байт под наши биты из которых состоит слово. // Аналог size_t frameLength = ceil(codeLength/8.0);
-	//size_t frameLength = ceil(codeLength / 8.0);
-	uint8_t *frameBuffer = new uint8_t[frameLength];//конечный вид строчки хранится тут
-	//size_t wordsCount = FileBitLength / codeLength;//число строк( сколько слов в сообщении)
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\11.16.bin)";
+	string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
+	size_t codeLength = 18004;
+	size_t infoLength = 16384;
 
-	size_t matrixRows = 0;//сколько строк уже записано в матрицу
-	size_t cacheRows = 0; // сколько строк сейчас находится в кэше
-	size_t leadElement = 0;//текущий ожидаемый ведущий столбец
+	size_t frameLength = (codeLength + 7) / 8;
+	uint8_t* frameBuffer = new uint8_t[frameLength];
+
+	size_t matrixRows = 0;
+	size_t cacheRows = 0;
 
 	ifstream file(InputFileName, ios::binary);
 	if (!file.is_open()) {
-		cout << "Ошибка открытия файла" << endl;
-		return false;
+		cout << "Ошибка открытия файла\n";
+		return 1;
 	}
-	else
-		cout << "Файл открыт" << endl;
+	cout << "Файл открыт\n";
 
 	file.seekg(0, ios::end);
 	size_t fileSizeBytes = file.tellg();
@@ -403,93 +422,131 @@ int main()
 	size_t fileSizeBits = fileSizeBytes * 8;
 	size_t wordsCount = fileSizeBits / codeLength;
 
-	uint8_t **matrix = new uint8_t*[infoLength];//массив для гауса
-	for (int i = 0; i < infoLength; i++) {
-		matrix[i] = new uint8_t[frameLength];// выделяем байты
+	// CPU-матрица
+	uint8_t** matrix = new uint8_t*[infoLength];
+	for (size_t i = 0; i < infoLength; i++) {
+		matrix[i] = new uint8_t[frameLength];
 		memset(matrix[i], 0, frameLength);
 	}
 
-	uint8_t **cache = new uint8_t*[wordsCount];// массив для кэша
-	for (int i = 0; i < wordsCount; i++) {
-		cache[i] = nullptr;// пока не будем выделять фулом память, просто заполним нулями
-	}
+	// CPU-кэш
+	uint8_t** cache = new uint8_t*[wordsCount];
+	for (size_t i = 0; i < wordsCount; i++)
+		cache[i] = nullptr;
 
-	// Считали все входное сообщение, и разделилил его на слова и записали в рам
-	uint8_t** fastRows = new uint8_t *[wordsCount];
-	for (int i = 0; i < wordsCount; i++) {
+	// CPU-RAM (fastRows)
+	uint8_t** fastRows = new uint8_t*[wordsCount];
+	for (size_t i = 0; i < wordsCount; i++) {
 		fastRows[i] = new uint8_t[frameLength];
 		ReadCodeWords(file, i, codeLength, fastRows[i]);
 	}
 
-	////////////
+	// pivot-ы
 	int* cwIndexFast = new int[wordsCount];
 	int* cwIndexCache = new int[wordsCount];
-
-	for (int i = 0; i < wordsCount; ++i) {
-		cwIndexFast[i] = -1;     // исходный индекс слова
-		cwIndexCache[i] = -1;    // пока пусто
-	}
-	// Создадим линейный массив строк
-	size_t totalBytes = wordsCount * frameLength; // Общее кол-во байтов всех строк
-	uint8_t* linearRows = new uint8_t[totalBytes]; // Один большой линейный массив, куда мы упаковываем все строки подряд
-
-	for (size_t i = 0; i < wordsCount; i++) {
-		memcpy(linearRows + i * frameLength, fastRows[i], frameLength);//копируем строки
+	for (size_t i = 0; i < wordsCount; ++i) {
+		cwIndexFast[i] = -1;
+		cwIndexCache[i] = -1;
 	}
 
-	// Выделим память на GPU
-	uint8_t *d_rows;
+	// линейный массив строк
+	size_t totalBytes = wordsCount * frameLength;
+	uint8_t* linearRows = new uint8_t[totalBytes];
+	for (size_t i = 0; i < wordsCount; i++)
+		memcpy(linearRows + i * frameLength, fastRows[i], frameLength);
+
+	// GPU: d_rows для pivot-ов
+	uint8_t* d_rows;
 	cudaMalloc(&d_rows, totalBytes);
-	// Скопируем строки на GPU
 	cudaMemcpy(d_rows, linearRows, totalBytes, cudaMemcpyHostToDevice);
-	// Выделим массив pivot‑ов на GPU
+
 	int* d_pivots;
-	cudaMalloc(&d_pivots, wordsCount * sizeof(int)); // sizeof(int) - возвращает размер целочисленного типа данных в байтах
+	cudaMalloc(&d_pivots, wordsCount * sizeof(int));
 
 	int* pivotsMatrix = new int[infoLength];
 	for (size_t i = 0; i < infoLength; ++i)
 		pivotsMatrix[i] = -1;
 
-	//Вычисляем блоки и потоки
 	int threadsPerBlock = 256;
 	int warpsPerBlock = threadsPerBlock / 32;
-	//int blocks = ceil(wordsCount / warpsPerBlock); //может не сработать, можно попробовать int blocks = (wordsCount + warpsPerBlock - 1) / warpsPerBlock;
-	int blocks = (wordsCount + warpsPerBlock - 1) / warpsPerBlock;
+	int blocks = (int)((wordsCount + warpsPerBlock - 1) / warpsPerBlock);
 
-	FindLeadingOneKernel << <blocks, threadsPerBlock >> > (d_rows, d_pivots, frameLength, wordsCount);
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess)
-		cout << "CUDA ERROR: " << cudaGetErrorString(err) << endl;
-	cout << "Посчитали первые единицы " << endl;
+	FindLeadingOneKernel << <blocks, threadsPerBlock >> > (
+		d_rows, d_pivots, (int)frameLength, (int)wordsCount);
+	cudaDeviceSynchronize();
 
-	int* pivots = new int[wordsCount]; // индекс первой единицы строки fastRows
+	int* pivots = new int[wordsCount];
 	cudaMemcpy(pivots, d_pivots, wordsCount * sizeof(int), cudaMemcpyDeviceToHost);
-	
-	for (size_t i = 0; i < wordsCount; ++i) {
+
+	for (size_t i = 0; i < wordsCount; ++i)
 		cwIndexFast[i] = pivots[i];
-	}
 
-	//cout << "Массив первых единиц (pivot'ы):\n";
-	//for (size_t i = 0; i < wordsCount; ++i) {
-	//	cout << "строка " << i << ": " << pivots[i] << '\n';
-	//}
+	// GPU: d_fastRows / d_cache / d_matrix
+	uint8_t* d_fastRows;
+	cudaMalloc(&d_fastRows, totalBytes);
+	cudaMemcpy(d_fastRows, linearRows, totalBytes, cudaMemcpyHostToDevice);
 
+	uint8_t* d_cache;
+	cudaMalloc(&d_cache, wordsCount * frameLength);
+	cudaMemset(d_cache, 0, wordsCount * frameLength);
 
-	ProcessAllFrame(matrix, cache, fastRows, frameBuffer, wordsCount, codeLength, frameLength, matrixRows, cacheRows, infoLength, cwIndexFast, cwIndexCache, pivotsMatrix);
-	WriteMatrixToFile(TempDir + "result.bin", matrix, matrixRows, frameLength); 
-	PrintMatrix(matrix, matrixRows, codeLength);
-	
+	uint8_t* d_matrix;
+	cudaMalloc(&d_matrix, infoLength * frameLength);
+	cudaMemset(d_matrix, 0, infoLength * frameLength);
 
-	//////////////////////////////////////////////
+	// Гаусс
+	ProcessAllFrame(
+		matrix,
+		cache,
+		fastRows,
+		frameBuffer,
+		d_fastRows,
+		d_cache,
+		d_matrix,
+		wordsCount,
+		codeLength,
+		frameLength,
+		matrixRows,
+		cacheRows,
+		infoLength,
+		cwIndexFast,
+		cwIndexCache,
+		pivotsMatrix);
+
+	WriteMatrixToFile(TempDir + "result.bin", matrix, matrixRows, frameLength);
+	//PrintMatrix(matrix, matrixRows, codeLength);
+
+	// очистка
 	file.close();
+
 	for (size_t i = 0; i < infoLength; i++)
 		delete[] matrix[i];
 	delete[] matrix;
 
-	for (size_t i = 0; i < cacheRows; i++) {
+	for (size_t i = 0; i < wordsCount; i++)
+		delete[] fastRows[i];
+	delete[] fastRows;
+
+	for (size_t i = 0; i < cacheRows; i++)
 		if (cache[i] != nullptr)
 			delete[] cache[i];
-	}
 	delete[] cache;
-	/////////////////////////////////////////////
+
+	delete[] frameBuffer;
+	delete[] cwIndexFast;
+	delete[] cwIndexCache;
+	delete[] pivotsMatrix;
+	delete[] pivots;
+	delete[] linearRows;
+
+	cudaFree(d_rows);
+	cudaFree(d_pivots);
+	cudaFree(d_fastRows);
+	cudaFree(d_cache);
+	cudaFree(d_matrix);
+
+	auto end = chrono::high_resolution_clock::now();
+	auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
+	cout << "Время выполнения программы в мс: " << duration.count() << endl;
+	return 0;
 }
