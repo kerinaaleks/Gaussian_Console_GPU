@@ -1,16 +1,10 @@
-﻿#include <iostream>
-#include <cmath>
-#include <ctime>
-#include <utility>
-#include <clocale>
-#include <algorithm>
-#include <fstream>
-#include <chrono>
+﻿#include <iostream>//
+#include <fstream>//
+#include <chrono>//
 
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
+#include "cuda_runtime.h"//
+#include "device_launch_parameters.h"//
+#include <device_functions.h>//
 
 using namespace std;
 
@@ -68,7 +62,6 @@ __global__ void XorRowsKernel(
 	bool fromCache,
 	int targetRow // Индекс строки матрицы с которой XOR‑им
 ) {
-
 	int tid = threadIdx.x + blockIdx.x * blockDim.x; // нормер байта строки, который должен обрботать этот поток
 
 	if (tid >= frameLength) // Проверка выхода за границы
@@ -80,31 +73,59 @@ __global__ void XorRowsKernel(
 	src[tid] ^= target[tid];
 }
 
-bool GetBit(const uint8_t* data, size_t bitIndex) {
-	size_t byte = bitIndex / 8;// у какого байта
-	size_t bit = bitIndex % 8;// какой бит берем
-	return (data[byte] >> bit) & 1; // возвращаем бит
+__device__ __forceinline__ bool GetBitDevice(const uint8_t* row, int bitIndex) {
+	int byte = bitIndex / 8;
+	int bit = bitIndex % 8;
+	return (row[byte] >> bit) & 1;
+}
+inline bool GetBitHost(const uint8_t* row, size_t bitIndex) {
+	size_t byte = bitIndex / 8;
+	size_t bit = bitIndex % 8;
+	return (row[byte] >> bit) & 1;
+}
+
+__global__ void ReverseGearKernel(
+	uint8_t* d_matrix,
+	int matrixRows,
+	int frameLength,
+	int pivotRow) {
+
+	int j = blockIdx.x; // Индекс строки которую обрабатываем (индекс текущего блока)
+	int tid = threadIdx.x; // Индекс байта который обрабатываем
+
+	if (j >= matrixRows)
+		return;
+
+	uint8_t* rowJ = d_matrix + j * frameLength;
+	const uint8_t* rowI = d_matrix + pivotRow * frameLength;
+
+	if (!GetBitDevice(rowJ, pivotRow))
+		return;
+
+	if (tid < frameLength)
+		((uint8_t*)rowJ)[tid] ^= rowI[tid];
 }
 
 int FindLeadingOne(uint8_t* frameBuffer, size_t codeLength) {
 
 	for (size_t i = 0; i < codeLength; i++) {
-		if (GetBit(frameBuffer, i)) {
+		if (GetBitHost(frameBuffer, i)) {
 			return i;// вернули индекс где встретили первую единицу в этой строке
 		}
 	}
 	return -1;//вот этим  числом сообщим что строка пустая
 }
 
-void ReverseGear(uint8_t** matrix, size_t matrixRows, size_t codeLength, size_t frameLength)
+void ReverseGearGPU(uint8_t* d_matrix, size_t matrixRows, size_t codeLength, size_t frameLength)
 {
-	for (int i = (int)matrixRows - 1; i > 0; i--) {
-		for (int j = 0; j < i; j++) {
-			if (GetBit(matrix[j], i)) {
-				for (size_t k = 0; k < frameLength; k++)
-					matrix[j][k] ^= matrix[i][k];
-			}
-		}
+	int threadPerBlock = 256;
+
+	for (int i = (int)matrixRows - 1; i > 0; --i) {
+		int blocks = (int)matrixRows;
+
+		ReverseGearKernel << <blocks, threadPerBlock >> > (d_matrix, (int)matrixRows, (int)frameLength, i);
+
+		cudaDeviceSynchronize();
 	}
 }
 
@@ -363,14 +384,18 @@ void ProcessAllFrame(
 		}
 	}
 
-	ReverseGear(matrix, infoLength, codeLength, frameLength);
+	ReverseGearGPU(d_matrix, matrixRows, codeLength, frameLength);
+
+	for (size_t i = 0; i < matrixRows; ++i) {
+		cudaMemcpy(matrix[i], d_matrix + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
+	}
 }
 //////////////////////////////////////////////////////////////////////
 void PrintMatrix(uint8_t** matrix, size_t matrixRows, size_t codeLength) {
 	cout << "Матрица после метода Гаусса\n\n";
 	for (size_t i = 0; i < matrixRows; i++) {
 		for (size_t j = 0; j < codeLength; j++) {
-			cout << static_cast<int>(GetBit(matrix[i], j)) << ' ';
+			cout << GetBitHost(matrix[i], j) << ' ';
 		}
 		cout << '\n';
 	}
@@ -397,10 +422,10 @@ int main()
 
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\11.16.bin)";
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.17.bin)";
 	string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
-	size_t codeLength = 18004;
-	size_t infoLength = 16384;
+	size_t codeLength = 2064;
+	size_t infoLength = 2000;
 
 	size_t frameLength = (codeLength + 7) / 8;
 	uint8_t* frameBuffer = new uint8_t[frameLength];
@@ -441,7 +466,7 @@ int main()
 		ReadCodeWords(file, i, codeLength, fastRows[i]);
 	}
 
-	// pivot-ы
+	// pivot-ы RAM и cache
 	int* cwIndexFast = new int[wordsCount];
 	int* cwIndexCache = new int[wordsCount];
 	for (size_t i = 0; i < wordsCount; ++i) {
@@ -449,52 +474,57 @@ int main()
 		cwIndexCache[i] = -1;
 	}
 
-	// линейный массив строк
+	// Линейный массив строк для GPU
 	size_t totalBytes = wordsCount * frameLength;
 	uint8_t* linearRows = new uint8_t[totalBytes];
 	for (size_t i = 0; i < wordsCount; i++)
 		memcpy(linearRows + i * frameLength, fastRows[i], frameLength);
 
-	// GPU: d_rows для pivot-ов
-	uint8_t* d_rows;
-	cudaMalloc(&d_rows, totalBytes);
-	cudaMemcpy(d_rows, linearRows, totalBytes, cudaMemcpyHostToDevice);
+	// ---------------- GPU ALLOC ----------------
 
+	// d_fastRows — строки RAM на GPU
+	uint8_t* d_fastRows;
+	cudaMalloc(&d_fastRows, totalBytes);
+	cudaMemcpy(d_fastRows, linearRows, totalBytes, cudaMemcpyHostToDevice);
+
+	// d_cache — строки cache на GPU
+	uint8_t* d_cache;
+	cudaMalloc(&d_cache, wordsCount * frameLength);
+	cudaMemset(d_cache, 0, wordsCount * frameLength);
+
+	// d_matrix — итоговая матрица на GPU
+	uint8_t* d_matrix;
+	cudaMalloc(&d_matrix, infoLength * frameLength);
+	cudaMemset(d_matrix, 0, infoLength * frameLength);
+
+	// d_pivots — pivots для всех строк RAM
 	int* d_pivots;
 	cudaMalloc(&d_pivots, wordsCount * sizeof(int));
 
+	// pivotsMatrix — pivots итоговой матрицы (CPU)
 	int* pivotsMatrix = new int[infoLength];
 	for (size_t i = 0; i < infoLength; ++i)
 		pivotsMatrix[i] = -1;
+
+	// ---------------- GPU: FindLeadingOneKernel ----------------
 
 	int threadsPerBlock = 256;
 	int warpsPerBlock = threadsPerBlock / 32;
 	int blocks = (int)((wordsCount + warpsPerBlock - 1) / warpsPerBlock);
 
 	FindLeadingOneKernel << <blocks, threadsPerBlock >> > (
-		d_rows, d_pivots, (int)frameLength, (int)wordsCount);
+		d_fastRows, d_pivots, (int)frameLength, (int)wordsCount);
 	cudaDeviceSynchronize();
 
+	// копируем pivots обратно
 	int* pivots = new int[wordsCount];
 	cudaMemcpy(pivots, d_pivots, wordsCount * sizeof(int), cudaMemcpyDeviceToHost);
 
 	for (size_t i = 0; i < wordsCount; ++i)
 		cwIndexFast[i] = pivots[i];
 
-	// GPU: d_fastRows / d_cache / d_matrix
-	uint8_t* d_fastRows;
-	cudaMalloc(&d_fastRows, totalBytes);
-	cudaMemcpy(d_fastRows, linearRows, totalBytes, cudaMemcpyHostToDevice);
+	// ---------------- Гаусс ----------------
 
-	uint8_t* d_cache;
-	cudaMalloc(&d_cache, wordsCount * frameLength);
-	cudaMemset(d_cache, 0, wordsCount * frameLength);
-
-	uint8_t* d_matrix;
-	cudaMalloc(&d_matrix, infoLength * frameLength);
-	cudaMemset(d_matrix, 0, infoLength * frameLength);
-
-	// Гаусс
 	ProcessAllFrame(
 		matrix,
 		cache,
@@ -516,7 +546,9 @@ int main()
 	WriteMatrixToFile(TempDir + "result.bin", matrix, matrixRows, frameLength);
 	//PrintMatrix(matrix, matrixRows, codeLength);
 
-	// очистка
+
+	// ---------------- Очистка ----------------
+
 	file.close();
 
 	for (size_t i = 0; i < infoLength; i++)
@@ -539,7 +571,6 @@ int main()
 	delete[] pivots;
 	delete[] linearRows;
 
-	cudaFree(d_rows);
 	cudaFree(d_pivots);
 	cudaFree(d_fastRows);
 	cudaFree(d_cache);
@@ -548,5 +579,6 @@ int main()
 	auto end = chrono::high_resolution_clock::now();
 	auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
 	cout << "Время выполнения программы в мс: " << duration.count() << endl;
+
 	return 0;
 }
