@@ -88,7 +88,8 @@ __global__ void ReverseGearKernel(
 	uint8_t* d_matrix,
 	int matrixRows,
 	int frameLength,
-	int pivotRow) {
+	int pivotRow,
+	int* d_pivotsMatrix) {
 
 	int j = blockIdx.x; // Индекс строки которую обрабатываем (индекс текущего блока)
 	int tid = threadIdx.x; // Индекс байта который обрабатываем
@@ -96,10 +97,17 @@ __global__ void ReverseGearKernel(
 	if (j >= matrixRows)
 		return;
 
+	if (j == pivotRow)
+		return;
+
 	uint8_t* rowJ = d_matrix + j * frameLength;
 	const uint8_t* rowI = d_matrix + pivotRow * frameLength;
 
-	if (!GetBitDevice(rowJ, pivotRow))
+	int pivotColumn = d_pivotsMatrix[pivotRow];
+
+	if (pivotColumn < 0) return;
+
+	if (!GetBitDevice(rowJ, pivotColumn))
 		return;
 
 	if (tid < frameLength)
@@ -137,14 +145,18 @@ int FindLeadingOne(uint8_t* frameBuffer, size_t codeLength) {
 	return -1;//вот этим  числом сообщим что строка пустая
 }
 
-void ReverseGearGPU(uint8_t* d_matrix, size_t matrixRows, size_t codeLength, size_t frameLength)
+void ReverseGearGPU(
+	uint8_t* d_matrix,
+	size_t matrixRows,
+	size_t frameLength,
+	int* d_pivotsMatrix)
 {
 	int threadPerBlock = 256;
-	
-	for (int i = (int)matrixRows - 1; i > 0; --i) {
-		int blocks = (int)matrixRows;
 
-		ReverseGearKernel << <blocks, threadPerBlock >> > (d_matrix, (int)matrixRows, (int)frameLength, i);
+	for (int i = (int)matrixRows - 1; i >= 0; --i) {
+		int blocks = i;
+
+		ReverseGearKernel << <blocks, threadPerBlock >> > (d_matrix, (int)matrixRows, (int)frameLength, i, d_pivotsMatrix);
 
 		cudaDeviceSynchronize();
 	}
@@ -228,6 +240,10 @@ bool ProcessFrameGPU(
 				cudaMemcpyHostToDevice);
 			pivotsMatrix[rowIndex] = pivot;
 			matrixRows++;
+			cudaMemcpy(d_pivotsMatrix + rowIndex,
+				&pivotsMatrix[rowIndex],
+				sizeof(int),
+				cudaMemcpyHostToDevice);
 			return true;
 		}
 
@@ -290,6 +306,10 @@ bool ProcessFrameGPU(
 			memcpy(cache[cacheRows], frameBuffer, frameLength);
 			cwIndexCache[cacheRows] = pivot;
 			cacheRows++;
+			cudaMemcpy(d_cache + (cacheRows - 1) * frameLength,
+				cache[cacheRows - 1],
+				frameLength,
+				cudaMemcpyHostToDevice);
 		}
 
 		return false;
@@ -371,6 +391,12 @@ void ProcessAllFrame(
 						delete[] cache[j];
 						cache[j] = nullptr;
 						cwIndexCache[j] = -1;
+						for (size_t k = j + 1; k < cacheRows; ++k) {
+							cudaMemcpy(d_cache + (k - 1) * frameLength,
+								d_cache + k * frameLength,
+								frameLength,
+								cudaMemcpyDeviceToDevice);
+						}
 						continue;
 					}
 
@@ -387,7 +413,12 @@ void ProcessAllFrame(
 					cacheRows--;
 					cache[cacheRows] = nullptr;
 					cwIndexCache[cacheRows] = -1;
-
+					for (size_t k = j + 1; k < cacheRows; ++k) {
+						cudaMemcpy(d_cache + (k - 1) * frameLength,
+							d_cache + k * frameLength,
+							frameLength,
+							cudaMemcpyDeviceToDevice);
+					}
 					break;
 				}
 			}
@@ -445,12 +476,17 @@ void ProcessAllFrame(
 			memset(matrix[rowIndex], 0, frameLength);
 			pivotsMatrix[rowIndex] = -1;
 			matrixRows++;
+
+			cudaMemcpy(d_pivotsMatrix + rowIndex,
+				&pivotsMatrix[rowIndex],
+				sizeof(int),
+				cudaMemcpyHostToDevice);
 		}
 	}
 
-	ReverseGearGPU(d_matrix, matrixRows, codeLength, frameLength);
+	ReverseGearGPU(d_matrix, matrixRows, frameLength, d_pivotsMatrix);
 
-	for (size_t i = 0; i < matrixRows; ++i) {
+	for (size_t i = 0; i < infoLength; ++i) {
 		cudaMemcpy(matrix[i], d_matrix + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
 	}
 }
