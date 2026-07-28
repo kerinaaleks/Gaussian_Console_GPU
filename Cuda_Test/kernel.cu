@@ -1,10 +1,10 @@
-﻿#include <iostream>//
-#include <fstream>//
-#include <chrono>//
+﻿﻿#include <iostream>
+#include <fstream>
+#include <chrono>
 
-#include "cuda_runtime.h"//
-#include "device_launch_parameters.h"//
-#include <device_functions.h>//
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <device_functions.h>
 
 using namespace std;
 
@@ -104,6 +104,27 @@ __global__ void ReverseGearKernel(
 
 	if (tid < frameLength)
 		((uint8_t*)rowJ)[tid] ^= rowI[tid];
+}
+
+__global__ void CheckZeroKernel(const uint8_t* rows, int frameLength, bool* result) {
+	int rowIndex = blockIdx.x; //строка
+	int tid = threadIdx.x; //байт внутри строки
+
+	__shared__ bool isZero;
+
+	if (tid == 0)
+		isZero = true; // считаем строку нулевой
+	__syncthreads();
+
+	const uint8_t* row = rows + rowIndex * frameLength;
+
+	if (tid < frameLength && row[tid] != 0) // если хоть один байт не равен 0, строка не нулевая
+		isZero = false;
+	__syncthreads();
+
+	if (tid == 0) // поток 0 записывает результат
+		result[rowIndex] = isZero;
+
 }
 
 int FindLeadingOne(uint8_t* frameBuffer, size_t codeLength) {
@@ -257,7 +278,8 @@ void ProcessAllFrame(
 	size_t infoLength,
 	int* cwIndexFast,
 	int* cwIndexCache,
-	int* pivotsMatrix)
+	int* pivotsMatrix,
+	bool* zeroFlags)
 {
 	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
 		cout << "итерация: " << rowIndex << endl;
@@ -268,7 +290,7 @@ void ProcessAllFrame(
 			if (cwIndexFast[i] == -1)
 				continue; // строки нет (пустая или уже использована)
 			// проверяем, что строка не нулевая
-			bool isZero = true;
+			/*bool isZero = true;
 			for (size_t b = 0; b < frameLength; ++b) {
 				if (fastRows[i][b] != 0) {
 					isZero = false;
@@ -278,8 +300,12 @@ void ProcessAllFrame(
 			if (isZero) {
 				cwIndexFast[i] = -1;
 				continue;
-			}
+			}*/
 
+			if (zeroFlags[i]) {
+				cwIndexFast[i] = -1;
+				continue;
+			}
 			memcpy(frameBuffer, fastRows[i], frameLength);
 			int pivot = cwIndexFast[i];
 
@@ -522,6 +548,18 @@ int main()
 
 	for (size_t i = 0; i < wordsCount; ++i)
 		cwIndexFast[i] = pivots[i];
+	// ---------------- GPU: CheckZeroKernel ----------------
+	bool* d_zeroFlags;
+	cudaMalloc(&d_zeroFlags, wordsCount * sizeof(bool));
+	int blocksZero = (int)wordsCount;
+
+	CheckZeroKernel << <blocksZero, threadsPerBlock >> > (d_fastRows, frameLength, d_zeroFlags);
+	cudaDeviceSynchronize();
+
+	bool* zeroFlags = new bool[wordsCount];
+	cudaMemcpy(zeroFlags, d_zeroFlags, wordsCount * sizeof(bool), cudaMemcpyDeviceToHost);
+
+
 
 	// ---------------- Гаусс ----------------
 
@@ -541,7 +579,8 @@ int main()
 		infoLength,
 		cwIndexFast,
 		cwIndexCache,
-		pivotsMatrix);
+		pivotsMatrix,
+		zeroFlags);
 
 	WriteMatrixToFile(TempDir + "result.bin", matrix, matrixRows, frameLength);
 	//PrintMatrix(matrix, matrixRows, codeLength);
