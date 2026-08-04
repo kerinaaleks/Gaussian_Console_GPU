@@ -119,16 +119,16 @@ __global__ void XorRowsKernel(
 
 	src[tid] ^= target[tid];
 	// раскоментить, это маска
-	/*int rem = codeLength % 8;
-	uint8_t mask = (rem == 0 ? 0xFF : (uint8_t)((1 << rem) - 1));
-	int lastByte = frameLength - 1;
+	//int rem = codeLength % 8;
+	//uint8_t mask = (rem == 0 ? 0xFF : (uint8_t)((1 << rem) - 1));
+	//int lastByte = frameLength - 1;
 
-	__syncthreads();
-	if (threadIdx.x == 0) {
-		src[lastByte] &= mask;
-		target[lastByte] &= mask;
-	}*/
-
+	////__syncthreads();
+	//if (threadIdx.x == 0) {
+	//	src[lastByte] &= mask;
+	//	//target[lastByte] &= mask;
+	//}
+	//// вот тут не факт что правильно сделала
 }
 
 __device__ __forceinline__ bool GetBitDevice(const uint8_t* row, int bitIndex) {
@@ -173,7 +173,7 @@ __global__ void ReverseGearKernel(
 
 	if (tid == 0) {
 		rowJ[frameLength - 1] &= mask;
-		rowI[frameLength - 1] &= mask;
+		//rowI[frameLength - 1] &= mask;
 	}
 }
 
@@ -242,11 +242,12 @@ void ReadCodeWords(ifstream& file, size_t cwIndex, size_t codeLength, uint8_t* d
 
 	for (size_t i = 0; i < codeLength; i++) {
 		size_t srcByte = (bitOffset + i) / 8;
-		size_t srcBit = 7 - ((bitOffset + i) % 8);
+		size_t srcBit = (bitOffset + i) % 8;
+		//size_t srcBit = 7 - ((bitOffset + i) % 8);
 		bool bit = (buf[srcByte] >> srcBit) & 1;
 		if (bit) {
 			size_t dstByte = i / 8;
-			size_t dstBit = 7 - (i % 8);
+			size_t dstBit = i % 8;
 			dst[dstByte] |= (1 << dstBit);
 		}
 	}
