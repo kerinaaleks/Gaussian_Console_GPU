@@ -194,7 +194,7 @@ void ReverseGearGPU(
 				d_matrix, (int)matrixRows, (int)frameLength,
 				i, d_pivotsMatrix, codeLength);
 	}
-	cudaDeviceSynchronize();
+	cudaDeviceSynchronize();   // один раз в конце
 }
 
 void ReadCodeWordsBin(ifstream& file, size_t cwIndex, size_t codeLength, uint8_t* dst) {
@@ -280,23 +280,37 @@ bool ProcessFrameGPU(
 	}
 
 	while (true) {
+		// ----------------------------------------------------------
+		// Случай 1: пивот подходит — принимаем строку
+		// ----------------------------------------------------------
 		if (pivot == rowIndex) {
+			// строка нужна на хосте только здесь
+			uint8_t* srcPtr = fromCache
+				? (d_cache + srcIndex * frameLength)
+				: (d_fastRows + srcIndex * frameLength);
+
+			cudaMemcpy(frameBuffer, srcPtr, frameLength, cudaMemcpyDeviceToHost);
 			memcpy(matrix[rowIndex], frameBuffer, frameLength);
 			cudaMemcpy(d_matrix + rowIndex * frameLength, frameBuffer, frameLength, cudaMemcpyHostToDevice);
+
 			pivotsMatrix[rowIndex] = pivot;
 			matrixRows++;
 			cudaMemcpy(d_pivotsMatrix + rowIndex, &pivot, sizeof(int), cudaMemcpyHostToDevice);
 			return true;
 		}
 
+		// ----------------------------------------------------------
+		// Случай 2: нужно элиминировать по уже найденному пивоту
+		// ----------------------------------------------------------
 		if (pivot < rowIndex) {
 			int init = INT_MAX;
 			cudaMemcpy(d_foundRow, &init, sizeof(int), cudaMemcpyHostToDevice);
 
 			int blocks = (int)((matrixRows + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-			FindPivotKernel << <blocks, THREADS_PER_BLOCK >> > (d_pivotsMatrix, (int)matrixRows, pivot, d_foundRow);
-			cudaDeviceSynchronize();
+			FindPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
+				d_pivotsMatrix, (int)matrixRows, pivot, d_foundRow);
 
+			// нужен только один int — синхронизация неизбежна
 			int target_row;
 			cudaMemcpy(&target_row, d_foundRow, sizeof(int), cudaMemcpyDeviceToHost);
 			if (target_row == INT_MAX) target_row = -1;
@@ -306,16 +320,17 @@ bool ProcessFrameGPU(
 			XorRowsKernel << <blocksXor, THREADS_PER_BLOCK >> > (
 				d_fastRows, d_cache, d_matrix,
 				(int)frameLength, srcIndex, fromCache, target_row, (int)codeLength);
-			cudaDeviceSynchronize();
+
+			// !!! убрали cudaDeviceSynchronize() здесь
+			// FindPivotInSingleRow сразу читает результат XOR на GPU
 
 			uint8_t* srcPtr = fromCache
 				? (d_cache + srcIndex * frameLength)
 				: (d_fastRows + srcIndex * frameLength);
 
 			FindPivotInSingleRow << <1, THREADS_PER_BLOCK >> > (srcPtr, (int)frameLength, d_pivotOut);
-			cudaDeviceSynchronize();
 
-			cudaMemcpy(frameBuffer, srcPtr, frameLength, cudaMemcpyDeviceToHost);
+			// забираем только новый пивот (4 байта), строку НЕ копируем
 			cudaMemcpy(&pivot, d_pivotOut, sizeof(int), cudaMemcpyDeviceToHost);
 
 			if (fromCache) {
@@ -340,7 +355,9 @@ bool ProcessFrameGPU(
 			continue;
 		}
 
-		// pivot > rowIndex
+		// ----------------------------------------------------------
+		// Случай 3: пивот ещё рано — в кэш / обновление индекса
+		// ----------------------------------------------------------
 		if (fromCache) {
 			cwIndexCache[srcIndex] = pivot;
 			cudaMemcpy(d_cwIndexCache + srcIndex, &pivot, sizeof(int), cudaMemcpyHostToDevice);
@@ -348,7 +365,10 @@ bool ProcessFrameGPU(
 		}
 		else {
 			if (cacheRows < wordsCount) {
-				cudaMemcpy(d_cache + cacheRows * frameLength, frameBuffer, frameLength, cudaMemcpyHostToDevice);
+				// строка уже лежит в d_fastRows[srcIndex], копируем в кэш на GPU
+				cudaMemcpy(d_cache + cacheRows * frameLength,
+					d_fastRows + srcIndex * frameLength,
+					frameLength, cudaMemcpyDeviceToDevice);
 				cwIndexCache[cacheRows] = pivot;
 				cudaMemcpy(d_cwIndexCache + cacheRows, &pivot, sizeof(int), cudaMemcpyHostToDevice);
 				cacheRows++;
@@ -373,7 +393,6 @@ void ProcessAllFrame(
 		for (size_t i = 0; i < wordsCount && !found; ++i) {
 			if (cwIndexFast[i] == -1) continue;
 
-			cudaMemcpy(frameBuffer, d_fastRows + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
 			int pivot = cwIndexFast[i];
 
 			if (ProcessFrameGPU(
@@ -434,7 +453,6 @@ void ProcessAllFrame(
 			cudaMemcpy(&target_row, d_foundRow, sizeof(int), cudaMemcpyDeviceToHost);
 
 			if (target_row != INT_MAX) {
-				cudaMemcpy(frameBuffer, d_cache + target_row * frameLength, frameLength, cudaMemcpyDeviceToHost);
 				int pivot = cwIndexCache[target_row];
 
 				if (ProcessFrameGPU(
@@ -543,8 +561,8 @@ int main()
 	const string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\11.1.bis)";
 	const string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
 
-	const size_t codeLength = 2000;
-	const size_t infoLength = 2000;
+	const size_t codeLength = 18004;
+	const size_t infoLength = 16384;
 	const size_t frameLength = (codeLength + 7) / 8;
 
 	const char dataType = 1;   // 0 = bin, 1 (или любое ненулевое) = bis
