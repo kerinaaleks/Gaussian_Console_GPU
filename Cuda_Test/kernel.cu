@@ -1,6 +1,7 @@
 ﻿#include <iostream>
 #include <fstream>
 #include <chrono>
+#include <iomanip>
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -8,8 +9,26 @@
 
 using namespace std;
 
+// Точные копии из эталона
+inline bool GetBit(char *data, int bitNum)
+{
+	int byteNum = bitNum / 8;
+	int shift = bitNum % 8;
+	return (data[byteNum] & (0x01 << shift)) != 0;
+}
+
+inline void SetBit(char *data, int bitNum, bool bitVal)
+{
+	int byteNum = bitNum / 8;
+	int shift = bitNum % 8;
+	if (bitVal)
+		data[byteNum] |= (0x01 << shift);
+	else
+		data[byteNum] &= ~(0x01 << shift);
+}
+
 // ============================================================================
-// ЯДРА
+// ЯДРА (Логика пивотов из первого файла)
 // ============================================================================
 
 __global__ void FindLeadingOneKernel(const uint8_t* __restrict__ rows, int* __restrict__ pivots, int frameLength, int wordsCount) {
@@ -24,7 +43,7 @@ __global__ void FindLeadingOneKernel(const uint8_t* __restrict__ rows, int* __re
 	const uint8_t* row = rows + rowIndex * frameLength;
 	int localPivot = INT_MAX;
 
-	// Покрываем ВСЮ строку, а не первые 64 байта
+	// Покрываем ВСЮ строку (логика из 1-го файла)
 	for (int b = laneId; b < frameLength; b += 32) {
 		uint8_t val = row[b];
 		if (val != 0) {
@@ -93,7 +112,8 @@ __global__ void XorRowsKernel(
 	int frameLength,
 	int srcIndex,
 	bool fromCache,
-	int targetRow
+	int targetRow,
+	int codeLength
 ) {
 	int tid = threadIdx.x + blockIdx.x * blockDim.x;
 	if (tid >= frameLength) return;
@@ -101,7 +121,17 @@ __global__ void XorRowsKernel(
 	uint8_t* src = fromCache ? (d_cache + srcIndex * frameLength)
 		: (d_fastRows + srcIndex * frameLength);
 	uint8_t* target = d_matrix + targetRow * frameLength;
+
 	src[tid] ^= target[tid];
+
+	// Если это самый последний байт строки, зануляем биты за пределами codeLength
+	if (tid == frameLength - 1) {
+		int rem = codeLength % 8;
+		if (rem != 0) {
+			uint8_t mask = (1 << rem) - 1;
+			src[tid] &= mask;
+		}
+	}
 }
 
 __device__ __forceinline__ bool GetBitDevice(const uint8_t* row, int bitIndex) {
@@ -116,13 +146,14 @@ inline bool GetBitHost(const uint8_t* row, size_t bitIndex) {
 	return (row[byte] >> bit) & 1;
 }
 
-// Обратный ход: каждый блок = строка j, потоки бегут циклом по всем байтам
+// Обратный ход
 __global__ void ReverseGearKernel(
 	uint8_t* d_matrix,
 	int matrixRows,
 	int frameLength,
 	int pivotRow,
-	int* d_pivotsMatrix)
+	int* d_pivotsMatrix,
+	int codeLength) // Добавили codeLength в аргументы
 {
 	int j = blockIdx.x;
 	if (j >= matrixRows) return;
@@ -134,8 +165,16 @@ __global__ void ReverseGearKernel(
 	if (pivotColumn < 0) return;
 	if (!GetBitDevice(rowJ, pivotColumn)) return;
 
-	for (int tid = threadIdx.x; tid < frameLength; tid += blockDim.x) {
-		rowJ[tid] ^= rowI[tid];
+	int tid = threadIdx.x;
+	for (int idx = tid; idx < frameLength; idx += blockDim.x) {
+		rowJ[idx] ^= rowI[idx];
+		if (idx == frameLength - 1) {
+			int rem = codeLength % 8;
+			if (rem != 0) {
+				uint8_t mask = (1 << rem) - 1;
+				rowJ[idx] &= mask;
+			}
+		}
 	}
 }
 
@@ -163,19 +202,12 @@ __global__ void ShiftIntKernel(int* arr, int start, int count) {
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ CPU
 // ============================================================================
 
-int FindLeadingOne(uint8_t* frameBuffer, size_t codeLength) {
-	for (size_t i = 0; i < codeLength; i++) {
-		if (GetBitHost(frameBuffer, i)) return (int)i;
-	}
-	return -1;
-}
-
-void ReverseGearGPU(uint8_t* d_matrix, size_t matrixRows, size_t frameLength, int* d_pivotsMatrix) {
+void ReverseGearGPU(uint8_t* d_matrix, size_t matrixRows, size_t frameLength, int* d_pivotsMatrix, int codeLength) {
 	int threadPerBlock = 256;
 	for (int i = (int)matrixRows - 1; i >= 0; --i) {
 		int blocks = i;
 		if (blocks > 0)
-			ReverseGearKernel << <blocks, threadPerBlock >> > (d_matrix, (int)matrixRows, (int)frameLength, i, d_pivotsMatrix);
+			ReverseGearKernel << <blocks, threadPerBlock >> > (d_matrix, (int)matrixRows, (int)frameLength, i, d_pivotsMatrix, codeLength);
 	}
 	cudaDeviceSynchronize();
 }
@@ -195,14 +227,22 @@ void ReadCodeWords(ifstream& file, size_t cwIndex, size_t codeLength, uint8_t* d
 
 	for (size_t i = 0; i < codeLength; i++) {
 		size_t srcByte = (bitOffset + i) / 8;
-		size_t srcBit = 7 - ((bitOffset + i) % 8);
+		size_t srcBit = (bitOffset + i) % 8;
 		bool bit = (buf[srcByte] >> srcBit) & 1;
 		if (bit) {
 			size_t dstByte = i / 8;
-			size_t dstBit = 7 - (i % 8);
+			size_t dstBit = i % 8;
 			dst[dstByte] |= (1 << dstBit);
 		}
 	}
+
+	// Очищаем хвостик последнего байта, если длина не кратна 8
+	size_t rem = codeLength % 8;
+	if (rem != 0) {
+		uint8_t mask = (1 << rem) - 1;
+		dst[frameLength - 1] &= mask;
+	}
+
 	delete[] buf;
 }
 
@@ -234,7 +274,6 @@ bool ProcessFrameGPU(
 	int* d_cwIndexCache
 )
 {
-	// КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #2: сразу синхронизируем CPU-индекс при нулевой строке
 	if (pivot == -1) {
 		if (fromCache) {
 			cwIndexCache[srcIndex] = -1;
@@ -276,7 +315,7 @@ bool ProcessFrameGPU(
 			int threadsPerBlock = 256;
 			int blocksXor = (int)((frameLength + threadsPerBlock - 1) / threadsPerBlock);
 			XorRowsKernel << <blocksXor, threadsPerBlock >> > (
-				d_fastRows, d_cache, d_matrix, (int)frameLength, srcIndex, fromCache, target_row);
+				d_fastRows, d_cache, d_matrix, (int)frameLength, srcIndex, fromCache, target_row, (int)codeLength);
 			cudaDeviceSynchronize();
 
 			uint8_t* srcPtr = fromCache ? (d_cache + srcIndex * frameLength)
@@ -357,7 +396,6 @@ void ProcessAllFrame(
 			if (cwIndexFast[i] == -1)
 				continue;
 
-			// КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #1: убрали проверку zeroFlags
 			cudaMemcpy(frameBuffer, d_fastRows + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
 			int pivot = cwIndexFast[i];
 
@@ -463,8 +501,8 @@ void ProcessAllFrame(
 		}
 	}
 
-	// 4. Обратный ход (исправлено: теперь покрывает все байты через цикл в ядре)
-	ReverseGearGPU(d_matrix, matrixRows, frameLength, d_pivotsMatrix);
+	// 4. Обратный ход
+	ReverseGearGPU(d_matrix, matrixRows, frameLength, d_pivotsMatrix, (int)codeLength);
 
 	for (size_t i = 0; i < infoLength; ++i) {
 		cudaMemcpy(matrix[i], d_matrix + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
@@ -475,26 +513,50 @@ void ProcessAllFrame(
 // ВВОД/ВЫВОД
 // ============================================================================
 
-void PrintMatrix(uint8_t** matrix, size_t matrixRows, size_t codeLength) {
-	cout << "Матрица после метода Гаусса\n\n";
-	for (size_t i = 0; i < matrixRows; i++) {
-		for (size_t j = 0; j < codeLength; j++) {
-			cout << GetBitHost(matrix[i], j) << ' ';
-		}
-		cout << '\n';
-	}
-}
-
-void WriteMatrixToFile(const string& fileName, uint8_t** matrix, size_t matrixRows, size_t frameLength) {
-	ofstream out(fileName, ios::binary);
+void WritePackedBitsToFile(
+	const std::string& fileName,
+	uint8_t** matrix,
+	size_t matrixRows,
+	size_t codeLength)
+{
+	std::ofstream out(fileName, std::ios::binary);
 	if (!out.is_open()) {
-		cout << "Ошибка открытия файла\n";
+		std::cout << "Не удалось открыть файл для записи\n";
 		return;
 	}
-	for (size_t i = 0; i < matrixRows; i++) {
-		out.write(reinterpret_cast<char*>(matrix[i]), frameLength);
+
+	// Сколько всего бит и байт нужно
+	size_t totalBits = matrixRows * codeLength;
+	size_t totalBytes = (totalBits + 7) / 8;
+
+	uint8_t* buf = new uint8_t[totalBytes];
+	memset(buf, 0, totalBytes);
+
+	size_t outBitPos = 0;
+
+	for (size_t row = 0; row < matrixRows; ++row)
+	{
+		uint8_t* data = matrix[row];
+
+		// Берём ровно codeLength бит (хвост автоматически игнорируется)
+		for (size_t b = 0; b < codeLength; ++b)
+		{
+			bool bit = GetBitHost(data, b);   // или GetBit((char*)data, b)
+
+			if (bit)
+			{
+				size_t byteIndex = outBitPos / 8;
+				size_t bitIndex = outBitPos % 8;
+				buf[byteIndex] |= (1u << bitIndex);   // LSB-first
+			}
+			outBitPos++;
+		}
 	}
+
+	out.write(reinterpret_cast<char*>(buf), totalBytes);
 	out.close();
+
+	delete[] buf;
 }
 
 // ============================================================================
@@ -507,7 +569,7 @@ int main()
 
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.17.bin)";
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.21.bin)";
 	string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
 	size_t codeLength = 18004;
 	size_t infoLength = 16384;
@@ -577,7 +639,7 @@ int main()
 	for (size_t i = 0; i < infoLength; ++i)
 		pivotsMatrix[i] = -1;
 
-	// ---------------- GPU: FindLeadingOneKernel (исправлен: покрывает все байты) ----------------
+	// ---------------- GPU: FindLeadingOneKernel ----------------
 
 	int threadsPerBlock = 256;
 	int warpsPerBlock = threadsPerBlock / 32;
@@ -628,8 +690,8 @@ int main()
 		d_cwIndexCache,
 		d_pivotOut);
 
-	WriteMatrixToFile(TempDir + "result.bin", matrix, matrixRows, frameLength);
-	//PrintMatrix(matrix, matrixRows, codeLength);
+
+	WritePackedBitsToFile(TempDir + "result.bin", matrix, matrixRows, codeLength);
 
 	// ---------------- Очистка ----------------
 	file.close();
