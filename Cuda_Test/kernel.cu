@@ -98,22 +98,36 @@ __global__ void XorRowsKernel(
 	int srcIndex,
 	bool fromCache,
 	int targetRow,
-	int codeLength)
+	int codeLength,
+	int physicalSlot)
 {
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
-	if (tid >= frameLength) return;
-
 	uint8_t* src = fromCache
-		? (d_cache + srcIndex * frameLength)
+		? (d_cache + physicalSlot * frameLength)
 		: (d_fastRows + srcIndex * frameLength);
-	uint8_t* target = d_matrix + targetRow * frameLength;
+	uint8_t* tgt = d_matrix + targetRow * frameLength;
 
-	src[tid] ^= target[tid];
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
 
-	if (tid == frameLength - 1) {
+	// Превращаем указатели в uint64_t* для обработки по 8 байт за раз
+	int numU64 = frameLength / 8;
+	uint64_t* src64 = reinterpret_cast<uint64_t*>(src);
+	uint64_t* tgt64 = reinterpret_cast<uint64_t*>(tgt);
+
+	for (int i = tid; i < numU64; i += stride) {
+		src64[i] ^= tgt64[i];
+	}
+
+	// Обработка оставшихся байт хвоста (если frameLength не кратно 8)
+	int tailStart = numU64 * 8;
+	if (blockIdx.x == 0 && threadIdx.x == 0) {
+		int tailStart = numU64 * 8;
+		for (int i = tailStart; i < frameLength; ++i) {
+			src[i] ^= tgt[i];
+		}
 		int rem = codeLength % 8;
 		if (rem != 0)
-			src[tid] &= (uint8_t)((1u << rem) - 1u);
+			src[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
 	}
 }
 
@@ -250,7 +264,10 @@ bool ProcessFrameGPU(
 	size_t& matrixRows, size_t& cacheRows,
 	int rowIndex, size_t wordsCount, int pivot,
 	int* cwIndexFast, int* cwIndexCache, int* pivotsMatrix,
-	int* d_pivotsMatrix, int* d_foundRow, int* d_pivotOut, int* d_cwIndexCache)
+	int* d_pivotsMatrix, int* d_foundRow, int* d_pivotOut, int* d_cwIndexCache,
+	const int* d_cacheSlotMap,
+	int physicalSlot // Фактический физический слот в кэше для текущего элемента
+)
 {
 	if (pivot == -1) {
 		if (fromCache) {
@@ -267,7 +284,7 @@ bool ProcessFrameGPU(
 	while (true) {
 		if (pivot == rowIndex) {
 			uint8_t* srcPtr = fromCache
-				? (d_cache + srcIndex * frameLength)
+				? (d_cache + physicalSlot * frameLength)
 				: (d_fastRows + srcIndex * frameLength);
 
 			cudaMemcpy(d_matrix + rowIndex * frameLength,
@@ -292,13 +309,16 @@ bool ProcessFrameGPU(
 			if (target_row == INT_MAX) target_row = -1;
 			if (target_row == -1) return false;
 
-			int blocksXor = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+			int n64 = frameLength / 8;
+			int blocksXor = (n64 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+			if (blocksXor < 1) blocksXor = 1;
+
 			XorRowsKernel << <blocksXor, THREADS_PER_BLOCK >> > (
 				d_fastRows, d_cache, d_matrix,
-				(int)frameLength, srcIndex, fromCache, target_row, (int)codeLength);
+				(int)frameLength, srcIndex, fromCache, target_row, (int)codeLength, physicalSlot);
 
 			uint8_t* srcPtr = fromCache
-				? (d_cache + srcIndex * frameLength)
+				? (d_cache + physicalSlot * frameLength)
 				: (d_fastRows + srcIndex * frameLength);
 
 			FindPivotInSingleRow << <1, THREADS_PER_BLOCK >> > (srcPtr, (int)frameLength, d_pivotOut);
@@ -334,14 +354,7 @@ bool ProcessFrameGPU(
 			return false;
 		}
 		else {
-			if (cacheRows < wordsCount) {
-				cudaMemcpy(d_cache + cacheRows * frameLength,
-					d_fastRows + srcIndex * frameLength,
-					frameLength, cudaMemcpyDeviceToDevice);
-				cwIndexCache[cacheRows] = pivot;
-				cudaMemcpy(d_cwIndexCache + cacheRows, &pivot, sizeof(int), cudaMemcpyHostToDevice);
-				cacheRows++;
-			}
+			// Логика добавления в кэш обрабатывается выше в ProcessAllFrame с использованием freeSlots
 			return false;
 		}
 	}
@@ -353,10 +366,12 @@ void ProcessAllFrame(
 	size_t wordsCount, size_t codeLength, size_t frameLength,
 	size_t& matrixRows, size_t& cacheRows, size_t infoLength,
 	int* cwIndexFast, int* cwIndexCache, int* pivotsMatrix,
-	int* d_pivotsMatrix, int* d_foundRow, int* d_cwIndexCache, int* d_pivotOut)
+	int* d_pivotsMatrix, int* d_foundRow, int* d_cwIndexCache, int* d_pivotOut,
+	int* cacheSlotMap, int* d_cacheSlotMap, int* freeSlots, int& freeCount, int& nextPhysicalSlot)
 {
 	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
 		bool found = false;
+		//cout << "итерация:" << rowIndex << endl;
 
 		// 1. Поиск в fastRows
 		for (size_t i = 0; i < wordsCount && !found; ++i) {
@@ -367,7 +382,7 @@ void ProcessAllFrame(
 				(int)i, false, d_fastRows, d_cache, d_matrix, matrix,
 				codeLength, frameLength, matrixRows, cacheRows, rowIndex, wordsCount,
 				pivot, cwIndexFast, cwIndexCache, pivotsMatrix,
-				d_pivotsMatrix, d_foundRow, d_pivotOut, d_cwIndexCache))
+				d_pivotsMatrix, d_foundRow, d_pivotOut, d_cwIndexCache, d_cacheSlotMap, 0))
 			{
 				found = true;
 				cwIndexFast[i] = -1;
@@ -375,38 +390,42 @@ void ProcessAllFrame(
 				size_t j = 0;
 				while (j < cacheRows) {
 					if (cwIndexCache[j] == -1) {
-						int blocks = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-						ShiftCacheKernel << <blocks, THREADS_PER_BLOCK >> > (
-							d_cache, (int)frameLength, (int)j, (int)cacheRows);
-						ShiftIntKernel << <(cacheRows - j + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >> > (
-							d_cwIndexCache, (int)j, (int)cacheRows);
-						cudaDeviceSynchronize();
+						// Возвращаем физический слот в пул свободных
+						freeSlots[freeCount++] = cacheSlotMap[j];
 
-						for (size_t k = j + 1; k < cacheRows; ++k)
+						for (size_t k = j + 1; k < cacheRows; ++k) {
 							cwIndexCache[k - 1] = cwIndexCache[k];
+							cacheSlotMap[k - 1] = cacheSlotMap[k];
+						}
 						cacheRows--;
 						cwIndexCache[cacheRows] = -1;
+						cacheSlotMap[cacheRows] = -1;
 						continue;
 					}
 
 					cudaMemcpy(d_fastRows + i * frameLength,
-						d_cache + j * frameLength,
+						d_cache + cacheSlotMap[j] * frameLength,
 						frameLength, cudaMemcpyDeviceToDevice);
 					cwIndexFast[i] = cwIndexCache[j];
 
-					int blocks = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-					ShiftCacheKernel << <blocks, THREADS_PER_BLOCK >> > (
-						d_cache, (int)frameLength, (int)j, (int)cacheRows);
-					ShiftIntKernel << <(cacheRows - j + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >> > (
-						d_cwIndexCache, (int)j, (int)cacheRows);
-					cudaDeviceSynchronize();
+					// Возвращаем освободившийся слот в пул свободных
+					freeSlots[freeCount++] = cacheSlotMap[j];
 
-					for (size_t k = j + 1; k < cacheRows; ++k)
+					for (size_t k = j + 1; k < cacheRows; ++k) {
 						cwIndexCache[k - 1] = cwIndexCache[k];
+						cacheSlotMap[k - 1] = cacheSlotMap[k];
+					}
 					cacheRows--;
 					cwIndexCache[cacheRows] = -1;
+					cacheSlotMap[cacheRows] = -1;
+
+					cudaMemcpy(d_cwIndexCache, cwIndexCache, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
+					cudaMemcpy(d_cacheSlotMap, cacheSlotMap, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
 					break;
 				}
+
+				cudaMemcpy(d_cwIndexCache, cwIndexCache, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
+				cudaMemcpy(d_cacheSlotMap, cacheSlotMap, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
 			}
 		}
 
@@ -424,36 +443,71 @@ void ProcessAllFrame(
 
 			if (target_row != INT_MAX) {
 				int pivot = cwIndexCache[target_row];
+				int pSlot = cacheSlotMap[target_row];
 
 				if (ProcessFrameGPU(
 					target_row, true, d_fastRows, d_cache, d_matrix, matrix,
 					codeLength, frameLength, matrixRows, cacheRows, rowIndex, wordsCount,
 					pivot, cwIndexFast, cwIndexCache, pivotsMatrix,
-					d_pivotsMatrix, d_foundRow, d_pivotOut, d_cwIndexCache))
+					d_pivotsMatrix, d_foundRow, d_pivotOut, d_cwIndexCache, d_cacheSlotMap, pSlot))
 				{
-					int blocks2 = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-					ShiftCacheKernel << <blocks2, THREADS_PER_BLOCK >> > (
-						d_cache, (int)frameLength, target_row, (int)cacheRows);
-					ShiftIntKernel << <(cacheRows - target_row + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >> > (
-						d_cwIndexCache, target_row, (int)cacheRows);
-					cudaDeviceSynchronize();
+					// Возвращаем слот в пул свободных без сдвига памяти в d_cache
+					freeSlots[freeCount++] = cacheSlotMap[target_row];
 
-					for (size_t j = target_row + 1; j < cacheRows; ++j)
+					for (size_t j = target_row + 1; j < cacheRows; ++j) {
 						cwIndexCache[j - 1] = cwIndexCache[j];
+						cacheSlotMap[j - 1] = cacheSlotMap[j];
+					}
 					cacheRows--;
 					cwIndexCache[cacheRows] = -1;
+					cacheSlotMap[cacheRows] = -1;
+
+					cudaMemcpy(d_cwIndexCache, cwIndexCache, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
+					cudaMemcpy(d_cacheSlotMap, cacheSlotMap, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
 					found = true;
+				}
+			}
+		}
+
+		// Если строка не найдена, проверяем нужно ли скинуть из fastRows в кэш (pivot > rowIndex)
+		if (!found) {
+			for (size_t i = 0; i < wordsCount; ++i) {
+				if (cwIndexFast[i] != -1 && cwIndexFast[i] > rowIndex) {
+					if (cacheRows < wordsCount) {
+						int p_slot = (freeCount > 0) ? freeSlots[--freeCount] : nextPhysicalSlot++;
+						cacheSlotMap[cacheRows] = (int)p_slot;
+
+						cudaMemcpy(d_cache + p_slot * frameLength,
+							d_fastRows + i * frameLength,
+							frameLength, cudaMemcpyDeviceToDevice);
+
+						cwIndexCache[cacheRows] = cwIndexFast[i];
+						cacheRows++;
+
+						cwIndexFast[i] = -1;
+
+						cudaMemcpy(d_cwIndexCache, cwIndexCache, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(d_cacheSlotMap, cacheSlotMap, cacheRows * sizeof(int), cudaMemcpyHostToDevice);
+					}
+					break;
 				}
 			}
 		}
 
 		// 3. Нулевая строка
 		if (!found) {
-			memset(matrix[rowIndex], 0, frameLength);
-			pivotsMatrix[rowIndex] = -1;
-			matrixRows++;
-			int m1 = -1;
-			cudaMemcpy(d_pivotsMatrix + rowIndex, &m1, sizeof(int), cudaMemcpyHostToDevice);
+			// Проверяем, действительно ли строка нулевая (не осталось ли подходящих в fastRows)
+			bool hasActive = false;
+			for (size_t i = 0; i < wordsCount; ++i) {
+				if (cwIndexFast[i] != -1) { hasActive = true; break; }
+			}
+			if (!hasActive && cacheRows == 0) {
+				memset(matrix[rowIndex], 0, frameLength);
+				pivotsMatrix[rowIndex] = -1;
+				matrixRows++;
+				int m1 = -1;
+				cudaMemcpy(d_pivotsMatrix + rowIndex, &m1, sizeof(int), cudaMemcpyHostToDevice);
+			}
 		}
 	}
 
@@ -532,8 +586,9 @@ int main()
 
 	const size_t codeLength = 18004;
 	const size_t infoLength = 16384;
-	const size_t frameLength = (codeLength + 7) / 8;
-	const char   dataType = 0;   // 0 = BIN, !=0 = BIS
+	const size_t rawFrameLength = (codeLength + 7) / 8;
+	const size_t frameLength = ((rawFrameLength + 7) / 8) * 8;
+	const char dataType = 0;
 
 	// ========================================================================
 	// Открытие файла
@@ -637,6 +692,24 @@ int main()
 	cudaMemcpy(d_cwIndexCache, cwIndexCache, wordsCount * sizeof(int), cudaMemcpyHostToDevice);
 	cudaMalloc(&d_pivotOut, sizeof(int));
 
+
+	// Массивы маппинга слотов кэша
+	int* cacheSlotMap = new int[wordsCount];
+	int* freeSlots = new int[wordsCount];
+	int freeCount = 0;
+	int nextPhysicalSlot = 0;
+
+	for (size_t i = 0; i < wordsCount; ++i) {
+		cwIndexCache[i] = -1; // Обнуляем кэш
+		cacheSlotMap[i] = (int)i; // Инициализируем маппинг
+	}
+
+	int* d_cacheSlotMap = nullptr;
+	cudaMalloc(&d_cacheSlotMap, wordsCount * sizeof(int));
+	cudaMemcpy(d_cacheSlotMap, cacheSlotMap, wordsCount * sizeof(int), cudaMemcpyHostToDevice);
+
+
+
 	// ========================================================================
 	// Гаусс
 	// ========================================================================
@@ -648,7 +721,7 @@ int main()
 		wordsCount, codeLength, frameLength,
 		matrixRows, cacheRows, infoLength,
 		cwIndexFast, cwIndexCache, pivotsMatrix,
-		d_pivotsMatrix, d_foundRow, d_cwIndexCache, d_pivotOut);
+		d_pivotsMatrix, d_foundRow, d_cwIndexCache, d_pivotOut, cacheSlotMap, d_cacheSlotMap, freeSlots, freeCount, nextPhysicalSlot);
 
 	// ========================================================================
 	// Запись результата
