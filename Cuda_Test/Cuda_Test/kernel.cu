@@ -2,6 +2,7 @@
 #include <fstream>
 #include <chrono>
 #include <cstring>
+#include <climits>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <device_functions.h>
@@ -11,49 +12,14 @@ using namespace std;
 constexpr int THREADS_PER_BLOCK = 256;
 
 // ============================================================================
-// ЯДРА РАСПАКОВКИ
+// ЯДРА
 // ============================================================================
 
-__global__ void UnpackBinKernel(const uint8_t* __restrict__ fileData, uint8_t* __restrict__ d_fastRows,
-	size_t codeLength, size_t frameLength, size_t wordsCount)
-{
-	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (idx >= wordsCount * codeLength) return;
-
-	size_t i = idx / codeLength;
-	size_t b = idx % codeLength;
-	size_t bitStart = i * codeLength + b;
-
-	if ((fileData[bitStart / 8] >> (bitStart % 8)) & 1) {
-		atomicOr(&d_fastRows[i * frameLength + (b / 8)], (uint8_t)(1u << (b % 8)));
-	}
-}
-
-__global__ void UnpackBisKernel(
-	const uint8_t* __restrict__ fileData,
-	uint8_t* __restrict__ d_fastRows,
-	size_t codeLength,
-	size_t frameLength,
-	size_t wordsCount)
-{
-	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	size_t totalBits = wordsCount * codeLength;
-	if (idx >= totalBits) return;
-
-	size_t i = idx / codeLength;
-	size_t b = idx % codeLength;
-
-	if (fileData[i * codeLength + b] != 0) {
-		atomicOr(&d_fastRows[i * frameLength + (b / 8)], (uint8_t)(1u << (b % 8)));
-	}
-}
-
-// ============================================================================
-// ЯДРА ГАУССА
-// ============================================================================
-
-__global__ void FindLeadingOneKernel(const uint8_t* __restrict__ rows, int* __restrict__ pivots,
-	int frameLength, int wordsCount)
+__global__ void FindLeadingOneKernel(
+	const uint8_t* __restrict__ rows,
+	int* __restrict__ pivots,
+	int frameLength,
+	int wordsCount)
 {
 	int laneId = threadIdx.x & 31;
 	int warpId = threadIdx.x >> 5;
@@ -126,35 +92,25 @@ __global__ void FindPivotInSingleRow(
 }
 
 __global__ void XorRowsKernel(
-	uint8_t* d_rows,
+	uint8_t* d_fastRows,
 	uint8_t* d_matrix,
 	int frameLength,
-	int srcRowIdx,
+	int srcIndex,
 	int targetRow,
 	int codeLength)
 {
-	uint8_t* src = d_rows + srcRowIdx * frameLength;
-	uint8_t* tgt = d_matrix + targetRow * frameLength;
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	if (tid >= frameLength) return;
 
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-	int stride = blockDim.x * gridDim.x;
+	uint8_t* src = d_fastRows + srcIndex * frameLength;
+	uint8_t* target = d_matrix + targetRow * frameLength;
 
-	int numU64 = frameLength / 8;
-	uint64_t* src64 = reinterpret_cast<uint64_t*>(src);
-	uint64_t* tgt64 = reinterpret_cast<uint64_t*>(tgt);
+	src[tid] ^= target[tid];
 
-	for (int i = tid; i < numU64; i += stride) {
-		src64[i] ^= tgt64[i];
-	}
-
-	if (blockIdx.x == 0 && threadIdx.x == 0) {
-		int tailStart = numU64 * 8;
-		for (int i = tailStart; i < frameLength; ++i) {
-			src[i] ^= tgt[i];
-		}
+	if (tid == frameLength - 1) {
 		int rem = codeLength % 8;
 		if (rem != 0)
-			src[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
+			src[tid] &= (uint8_t)((1u << rem) - 1u);
 	}
 }
 
@@ -224,61 +180,130 @@ void ReverseGearGPU(
 	cudaDeviceSynchronize();
 }
 
+void ReadCodeWordsBin(const uint8_t* fileData, size_t cwIndex,
+	size_t codeLength, uint8_t* dst)
+{
+	size_t bitStart = cwIndex * codeLength;
+	size_t byteStart = bitStart / 8;
+	size_t bitOffset = bitStart % 8;
+	size_t frameLength = (codeLength + 7) / 8;
+
+	memset(dst, 0, frameLength);
+
+	for (size_t i = 0; i < codeLength; ++i) {
+		size_t srcByte = byteStart + (bitOffset + i) / 8;
+		size_t srcBit = (bitOffset + i) % 8;
+		if ((fileData[srcByte] >> srcBit) & 1)
+			dst[i / 8] |= (1u << (i % 8));
+	}
+
+	size_t rem = codeLength % 8;
+	if (rem != 0)
+		dst[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
+}
+
+void ReadCodeWordsBis(const uint8_t* fileData, size_t cwIndex,
+	size_t codeLength, uint8_t* dst)
+{
+	size_t frameLength = (codeLength + 7) / 8;
+	const uint8_t* src = fileData + cwIndex * codeLength;
+
+	memset(dst, 0, frameLength);
+
+	for (size_t i = 0; i < codeLength; ++i) {
+		if (src[i] != 0)
+			dst[i / 8] |= (1u << (i % 8));
+	}
+
+	size_t rem = codeLength % 8;
+	if (rem != 0)
+		dst[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
+}
+
 // ============================================================================
-// Упрощенная логика Гаусса без кэша
+// Основная логика Гаусса (в одном массиве с разделением приоритетов)
 // ============================================================================
 
-void ProcessAllFrameWithoutCache(
+void ProcessAllFrame(
 	uint8_t** matrix,
-	uint8_t* d_rows, uint8_t* d_matrix,
+	uint8_t* d_fastRows, uint8_t* d_matrix,
 	size_t wordsCount, size_t codeLength, size_t frameLength,
 	size_t& matrixRows, size_t infoLength,
-	int* cwIndex, int* pivotsMatrix,
+	int* cwIndexFast, int* rowType, int* pivotsMatrix,
 	int* d_pivotsMatrix, int* d_foundRow, int* d_pivotOut)
 {
-	matrixRows = 0;
-
 	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
 		bool found = false;
 
 		while (!found) {
-			// 1. Ищем строку в d_rows с точным совпадением ведущего элемента (pivot == rowIndex)
+			// ================================================================
+			// 1. ИЩЕМ ТОЧНОЕ СОВПАДЕНИЕ (pivot == rowIndex)
+			// Сначала в RAM (rowType == 0), потом в Cache (rowType == 1)
+			// ================================================================
 			int selectedRowIndex = -1;
+
+			// Проход по RAM
 			for (size_t i = 0; i < wordsCount; ++i) {
-				if (cwIndex[i] == rowIndex) {
+				if (rowType[i] == 0 && cwIndexFast[i] == rowIndex) {
 					selectedRowIndex = (int)i;
 					found = true;
 					break;
 				}
 			}
 
+			// Проход по Cache, если в RAM не нашли
+			if (!found) {
+				for (size_t i = 0; i < wordsCount; ++i) {
+					if (rowType[i] == 1 && cwIndexFast[i] == rowIndex) {
+						selectedRowIndex = (int)i;
+						found = true;
+						break;
+					}
+				}
+			}
+
 			if (found) {
-				// Копируем найденную строку в итоговую матрицу на позицию matrixRows
+				// Добавляем строку в итоговую матрицу
 				cudaMemcpy(d_matrix + matrixRows * frameLength,
-					d_rows + selectedRowIndex * frameLength,
+					d_fastRows + selectedRowIndex * frameLength,
 					frameLength, cudaMemcpyDeviceToDevice);
 
 				pivotsMatrix[matrixRows] = rowIndex;
 				cudaMemcpy(d_pivotsMatrix + matrixRows, &rowIndex, sizeof(int), cudaMemcpyHostToDevice);
 
 				matrixRows++;
-				cwIndex[selectedRowIndex] = -1; // Помечаем как отработанную
+				rowType[selectedRowIndex] = -1; // Помечаем как отработанную (Dead)
 				break;
 			}
 
-			// 2. Если точного совпадения нет, ищем строку с наименьшим пивотом > rowIndex для редукции
-			int minLargerPivot = INT_MAX;
+			// ================================================================
+			// 2. ЕСЛИ ТОЧНОГО СОВПАДЕНИЯ НЕТ, ИЩЕМ СТРОКУ ДЛЯ РЕДУКЦИИ (pivot < rowIndex)
+			// Сначала проверяем RAM, затем Cache.
+			// ================================================================
 			int candidateRow = -1;
 
+			// Ищем в RAM строку, чей пивот уже «пройден» (< rowIndex)
 			for (size_t i = 0; i < wordsCount; ++i) {
-				if (cwIndex[i] > rowIndex && cwIndex[i] < minLargerPivot) {
-					minLargerPivot = cwIndex[i];
+				if (rowType[i] == 0 && cwIndexFast[i] != -1 && cwIndexFast[i] < rowIndex) {
 					candidateRow = (int)i;
+					break;
+				}
+			}
+
+			// Если в RAM нет, ищем в Cache
+			if (candidateRow == -1) {
+				for (size_t i = 0; i < wordsCount; ++i) {
+					if (rowType[i] == 1 && cwIndexFast[i] != -1 && cwIndexFast[i] < rowIndex) {
+						candidateRow = (int)i;
+						break;
+					}
 				}
 			}
 
 			if (candidateRow != -1) {
-				// Ищем в уже построенной части d_matrix строку, у которой пивот равен minLargerPivot
+				int currentPivot = cwIndexFast[candidateRow];
+
+				// Ищем базовую строку в d_matrix с таким же пивотом
 				int init = INT_MAX;
 				cudaMemcpy(d_foundRow, &init, sizeof(int), cudaMemcpyHostToDevice);
 
@@ -286,38 +311,74 @@ void ProcessAllFrameWithoutCache(
 				if (blocks < 1) blocks = 1;
 
 				FindPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
-					d_pivotsMatrix, (int)matrixRows, minLargerPivot, d_foundRow);
+					d_pivotsMatrix, (int)matrixRows, currentPivot, d_foundRow);
 
 				int target_row;
 				cudaMemcpy(&target_row, d_foundRow, sizeof(int), cudaMemcpyDeviceToHost);
 
 				if (target_row != INT_MAX) {
-					// Делаем XOR текущей строки с уже готовой базисной строкой
-					int n64 = frameLength / 8;
-					int blocksXor = (n64 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+					// Делаем XOR
+					int blocksXor = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 					if (blocksXor < 1) blocksXor = 1;
 
 					XorRowsKernel << <blocksXor, THREADS_PER_BLOCK >> > (
-						d_rows, d_matrix, (int)frameLength, candidateRow, target_row, (int)codeLength);
+						d_fastRows, d_matrix, (int)frameLength, candidateRow, target_row, (int)codeLength);
 
-					// Пересчитываем пивот для измененной строки
+					// Пересчитываем пивот
 					FindPivotInSingleRow << <1, THREADS_PER_BLOCK >> > (
-						d_rows + candidateRow * frameLength, (int)frameLength, d_pivotOut);
+						d_fastRows + candidateRow * frameLength, (int)frameLength, d_pivotOut);
 
-					cudaMemcpy(&cwIndex[candidateRow], d_pivotOut, sizeof(int), cudaMemcpyDeviceToHost);
-					continue; // Повторяем проверку для текущего rowIndex
+					int newPivot;
+					cudaMemcpy(&newPivot, d_pivotOut, sizeof(int), cudaMemcpyDeviceToHost);
+
+					cwIndexFast[candidateRow] = newPivot;
+
+					// Если пивот стал -1, отключаем строку
+					if (newPivot == -1) {
+						rowType[candidateRow] = -1;
+					}
+					// Если пивот стал больше rowIndex, переводим строку в разряд Cache
+					else if (newPivot > rowIndex) {
+						rowType[candidateRow] = 1;
+					}
+
+					continue; // Рекурсивно повторяем поиск для текущего rowIndex
 				}
 			}
 
-			// 3. Если ничего подходящего не нашли — выходим из цикла поиска для этого rowIndex
+			// ================================================================
+			// 3. ЕСЛИ ПИВОТ ОКАЗАЛСЯ СЛИШКОМ СПРАВА (pivot > rowIndex)
+			// Проверяем, есть ли в RAM свежие строки, которые опережают текущий rowIndex.
+			// Если есть — переводим их в кэш, чтобы они дождались своего часа.
+			// ================================================================
+			bool movedToCache = false;
+			for (size_t i = 0; i < wordsCount; ++i) {
+				if (rowType[i] == 0 && cwIndexFast[i] > rowIndex) {
+					rowType[i] = 1; // Переводим в кэш
+					movedToCache = true;
+				}
+			}
+
+			if (movedToCache) {
+				continue; // Пробуем снова найти совпадение для этого rowIndex
+			}
+
+			// ================================================================
+			// 4. НИЧЕГО НЕ ПОДОШЛО — ФОРМИРУЕМ НУЛЕВУЮ СТРОКУ
+			// ================================================================
+			memset(matrix[rowIndex], 0, frameLength);
+			pivotsMatrix[rowIndex] = -1;
+			matrixRows++;
+			int m1 = -1;
+			cudaMemcpy(d_pivotsMatrix + rowIndex, &m1, sizeof(int), cudaMemcpyHostToDevice);
 			break;
 		}
 	}
 
-	// Обратный ход выполняется только для реально найденных строк (matrixRows)
+	// Обратный ход Гаусса
 	ReverseGearGPU(d_matrix, matrixRows, frameLength, d_pivotsMatrix, (int)codeLength);
 
-	for (size_t i = 0; i < matrixRows; ++i)
+	for (size_t i = 0; i < infoLength; ++i)
 		cudaMemcpy(matrix[i], d_matrix + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
 }
 
@@ -333,7 +394,10 @@ void WriteResultToFile(
 	bool isBis)
 {
 	ofstream out(fileName, ios::binary);
-	if (!out.is_open()) return;
+	if (!out.is_open()) {
+		cerr << "Не удалось открыть файл для записи\n";
+		return;
+	}
 
 	if (isBis) {
 		size_t totalBytes = matrixRows * codeLength;
@@ -365,6 +429,7 @@ void WriteResultToFile(
 		out.write(reinterpret_cast<char*>(buf), totalBytes);
 		delete[] buf;
 	}
+
 	out.close();
 }
 
@@ -377,75 +442,92 @@ int main()
 	setlocale(LC_ALL, "");
 	auto start = chrono::high_resolution_clock::now();
 
+	// Параметры
 	const string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.21.bin)";
 	const string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
 
 	const size_t codeLength = 18004;
 	const size_t infoLength = 16384;
-	const size_t rawFrameLength = (codeLength + 7) / 8;
-	const size_t frameLength = ((rawFrameLength + 7) / 8) * 8;
-	const char dataType = 0;
+	const size_t frameLength = (codeLength + 7) / 8;
+	const char dataType = 0;   // 0 = BIN, !=0 = BIS
 
+	// Открытие файла
 	ifstream file(InputFileName, ios::binary);
-	if (!file.is_open()) return 1;
+	if (!file.is_open()) {
+		cerr << "Ошибка открытия файла\n";
+		return 1;
+	}
 
 	file.seekg(0, ios::end);
 	size_t fileSizeBytes = file.tellg();
 	file.seekg(0, ios::beg);
 
-	size_t wordsCount = dataType ? (fileSizeBytes / codeLength) : (fileSizeBytes * 8 / codeLength);
+	size_t wordsCount = dataType
+		? (fileSizeBytes / codeLength)
+		: (fileSizeBytes * 8 / codeLength);
+
 	size_t totalBytes = wordsCount * frameLength;
 
+	// Матрица результата
 	uint8_t** matrix = new uint8_t*[infoLength];
 	for (size_t i = 0; i < infoLength; ++i)
 		matrix[i] = new uint8_t[frameLength]();
 
+	// Чтение входных данных
 	uint8_t* fileData = new uint8_t[fileSizeBytes];
 	file.read(reinterpret_cast<char*>(fileData), fileSizeBytes);
 	file.close();
 
-	uint8_t* d_fileData = nullptr;
-	cudaMalloc(&d_fileData, fileSizeBytes);
-	cudaMemcpy(d_fileData, fileData, fileSizeBytes, cudaMemcpyHostToDevice);
-	delete[] fileData;
+	uint8_t* linearRows = nullptr;
+	cudaMallocHost(&linearRows, totalBytes);
 
-	int* cwIndex = new int[wordsCount];
-	for (size_t i = 0; i < wordsCount; ++i) cwIndex[i] = -1;
+	for (size_t i = 0; i < wordsCount; ++i) {
+		if (dataType)
+			ReadCodeWordsBis(fileData, i, codeLength, linearRows + i * frameLength);
+		else
+			ReadCodeWordsBin(fileData, i, codeLength, linearRows + i * frameLength);
+	}
+
+	delete[] fileData;
+	fileData = nullptr;
+
+	// Индексы и типы строк
+	int* cwIndexFast = new int[wordsCount];
+	int* rowType = new int[wordsCount]; // 0 = RAM, 1 = Cache, -1 = Dead
+	for (size_t i = 0; i < wordsCount; ++i) {
+		cwIndexFast[i] = -1;
+		rowType[i] = 0; // Изначально все строки относятся к RAM
+	}
 
 	int* pivotsMatrix = new int[infoLength];
-	for (size_t i = 0; i < infoLength; ++i) pivotsMatrix[i] = -1;
+	for (size_t i = 0; i < infoLength; ++i)
+		pivotsMatrix[i] = -1;
 
-	uint8_t *d_rows = nullptr, *d_matrix = nullptr;
+	// GPU-память
+	uint8_t *d_fastRows = nullptr, *d_matrix = nullptr;
 	int *d_pivots = nullptr, *d_pivotsMatrix = nullptr;
 	int *d_foundRow = nullptr, *d_pivotOut = nullptr;
 
-	cudaMalloc(&d_rows, totalBytes);
-	cudaMemset(d_rows, 0, totalBytes);
+	cudaMalloc(&d_fastRows, totalBytes);
+	cudaMemcpy(d_fastRows, linearRows, totalBytes, cudaMemcpyHostToDevice);
+	cudaFreeHost(linearRows);
+	linearRows = nullptr;
 
 	cudaMalloc(&d_matrix, infoLength * frameLength);
 	cudaMemset(d_matrix, 0, infoLength * frameLength);
 
-	size_t totalThreads = wordsCount * codeLength;
-	int blocksUnpack = (int)((totalThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	cudaMalloc(&d_pivots, wordsCount * sizeof(int));
 
-	if (dataType) {
-		UnpackBisKernel << <blocksUnpack, THREADS_PER_BLOCK >> > (d_fileData, d_rows, codeLength, frameLength, wordsCount);
-	}
-	else {
-		UnpackBinKernel << <blocksUnpack, THREADS_PER_BLOCK >> > (d_fileData, d_rows, codeLength, frameLength, wordsCount);
-	}
-	cudaDeviceSynchronize();
-	cudaFree(d_fileData);
-
+	// Первичный поиск ведущих единиц
 	{
-		cudaMalloc(&d_pivots, wordsCount * sizeof(int));
 		int warpsPerBlock = THREADS_PER_BLOCK / 32;
 		int blocks = (int)((wordsCount + warpsPerBlock - 1) / warpsPerBlock);
 		FindLeadingOneKernel << <blocks, THREADS_PER_BLOCK >> > (
-			d_rows, d_pivots, (int)frameLength, (int)wordsCount);
+			d_fastRows, d_pivots, (int)frameLength, (int)wordsCount);
 		cudaDeviceSynchronize();
-		cudaMemcpy(cwIndex, d_pivots, wordsCount * sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(cwIndexFast, d_pivots, wordsCount * sizeof(int), cudaMemcpyDeviceToHost);
 		cudaFree(d_pivots);
+		d_pivots = nullptr;
 	}
 
 	cudaMalloc(&d_pivotsMatrix, infoLength * sizeof(int));
@@ -454,24 +536,30 @@ int main()
 	cudaMalloc(&d_foundRow, sizeof(int));
 	cudaMalloc(&d_pivotOut, sizeof(int));
 
+	// Гаусс
 	size_t matrixRows = 0;
 
-	ProcessAllFrameWithoutCache(
-		matrix, d_rows, d_matrix,
+	ProcessAllFrame(
+		matrix,
+		d_fastRows, d_matrix,
 		wordsCount, codeLength, frameLength,
 		matrixRows, infoLength,
-		cwIndex, pivotsMatrix,
+		cwIndexFast, rowType, pivotsMatrix,
 		d_pivotsMatrix, d_foundRow, d_pivotOut);
 
+	// Запись результата
 	string outName = TempDir + (dataType ? "result.bis" : "result.bin");
 	WriteResultToFile(outName, matrix, matrixRows, codeLength, dataType != 0);
 
-	for (size_t i = 0; i < infoLength; ++i) delete[] matrix[i];
+	// Очистка
+	for (size_t i = 0; i < infoLength; ++i)
+		delete[] matrix[i];
 	delete[] matrix;
-	delete[] cwIndex;
+	delete[] cwIndexFast;
+	delete[] rowType;
 	delete[] pivotsMatrix;
 
-	cudaFree(d_rows);
+	cudaFree(d_fastRows);
 	cudaFree(d_matrix);
 	cudaFree(d_pivotsMatrix);
 	cudaFree(d_foundRow);
