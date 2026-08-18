@@ -401,8 +401,8 @@ int main()
 	auto start = chrono::high_resolution_clock::now();
 
 	// Параметры
-	const string InputFileName = "6.21.bin";
-	const string TempDir = "";
+	const string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\4.4.bin)";
+	const string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
 
 	const size_t codeLength = 18004;
 	const size_t infoLength = 16384;
@@ -530,3 +530,4 @@ int main()
 	cout << "Время выполнения программы в мс: " << ms << endl;
 	return 0;
 }
+/////////
