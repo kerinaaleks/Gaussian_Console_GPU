@@ -11,10 +11,6 @@ using namespace std;
 
 constexpr int THREADS_PER_BLOCK = 256;
 
-// ============================================================================
-// ЯДРА
-// ============================================================================
-
 __global__ void FindLeadingOneKernel(
 	const uint8_t* __restrict__ rows,
 	int* __restrict__ pivots,
@@ -49,69 +45,6 @@ __global__ void FindLeadingOneKernel(
 
 	if (laneId == 0)
 		pivots[rowIndex] = (localPivot == INT_MAX) ? -1 : localPivot;
-}
-
-__global__ void FindPivotInSingleRow(
-	const uint8_t* row,
-	int frameLength,
-	int* pivotOut)
-{
-	int tid = threadIdx.x;
-	int laneId = tid & 31;
-	int warpId = tid >> 5;
-	__shared__ int warpMin[THREADS_PER_BLOCK / 32];
-
-	int localPivot = INT_MAX;
-
-	for (int b = tid; b < frameLength; b += blockDim.x) {
-		uint8_t v = row[b];
-		if (v != 0) {
-			for (int bit = 0; bit < 8; ++bit) {
-				if (v & (1 << bit)) {
-					localPivot = min(localPivot, b * 8 + bit);
-					break;
-				}
-			}
-		}
-	}
-
-	for (int offset = 16; offset > 0; offset >>= 1)
-		localPivot = min(localPivot, __shfl_down_sync(0xFFFFFFFFu, localPivot, offset));
-
-	if (laneId == 0)
-		warpMin[warpId] = localPivot;
-
-	__syncthreads();
-
-	if (tid == 0) {
-		int finalPivot = INT_MAX;
-		for (int i = 0; i < (blockDim.x >> 5); ++i)
-			finalPivot = min(finalPivot, warpMin[i]);
-		*pivotOut = (finalPivot == INT_MAX) ? -1 : finalPivot;
-	}
-}
-
-__global__ void XorRowsKernel(
-	uint8_t* d_fastRows,
-	uint8_t* d_matrix,
-	int frameLength,
-	int srcIndex,
-	int targetRow,
-	int codeLength)
-{
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
-	if (tid >= frameLength) return;
-
-	uint8_t* src = d_fastRows + srcIndex * frameLength;
-	uint8_t* target = d_matrix + targetRow * frameLength;
-
-	src[tid] ^= target[tid];
-
-	if (tid == frameLength - 1) {
-		int rem = codeLength % 8;
-		if (rem != 0)
-			src[tid] &= (uint8_t)((1u << rem) - 1u);
-	}
 }
 
 __device__ __forceinline__ bool GetBitDevice(const uint8_t* row, int bitIndex)
@@ -151,18 +84,6 @@ __global__ void ReverseGearKernel(
 		}
 	}
 }
-
-__global__ void FindPivotKernel(const int* pivotsMatrix, int matrixRows, int pivot, int* result)
-{
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
-	if (tid >= matrixRows) return;
-	if (pivotsMatrix[tid] == pivot)
-		atomicMin(result, tid);
-}
-
-// ============================================================================
-// CPU-помощники
-// ============================================================================
 
 void ReverseGearGPU(
 	uint8_t* d_matrix,
@@ -220,166 +141,206 @@ void ReadCodeWordsBis(const uint8_t* fileData, size_t cwIndex,
 		dst[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
 }
 
-// ============================================================================
-// Основная логика Гаусса (в одном массиве с разделением приоритетов)
-// ============================================================================
-
-void ProcessAllFrame(
-	uint8_t** matrix,
-	uint8_t* d_fastRows, uint8_t* d_matrix,
-	size_t wordsCount, size_t codeLength, size_t frameLength,
-	size_t& matrixRows, size_t infoLength,
-	int* cwIndexFast, int* rowType, int* pivotsMatrix,
-	int* d_pivotsMatrix, int* d_foundRow, int* d_pivotOut)
+__device__ int DevFindExactType(const int* pivots, const int* rowType,
+	int n, int value, int wantType)
 {
-	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
-		bool found = false;
+	__shared__ int best;
+	if (threadIdx.x == 0) best = INT_MAX;
+	__syncthreads();
 
-		while (!found) {
-			// ================================================================
-			// 1. ИЩЕМ ТОЧНОЕ СОВПАДЕНИЕ (pivot == rowIndex)
-			// Сначала в RAM (rowType == 0), потом в Cache (rowType == 1)
-			// ================================================================
-			int selectedRowIndex = -1;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		if (rowType[i] == wantType && pivots[i] == value)
+			atomicMin(&best, i);
+	}
+	__syncthreads();
+	return best;
+}
 
-			// Проход по RAM
-			for (size_t i = 0; i < wordsCount; ++i) {
-				if (rowType[i] == 0 && cwIndexFast[i] == rowIndex) {
-					selectedRowIndex = (int)i;
-					found = true;
+__device__ int DevFindLessType(const int* pivots, const int* rowType,
+	int n, int rowIndex, int wantType)
+{
+	__shared__ int best;
+	if (threadIdx.x == 0) best = INT_MAX;
+	__syncthreads();
+
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		int p = pivots[i];
+		if (rowType[i] == wantType && p != -1 && p < rowIndex)
+			atomicMin(&best, i);
+	}
+	__syncthreads();
+	return best;
+}
+
+__device__ void DevXor(uint8_t* src, const uint8_t* tgt, int frameLength, int codeLength)
+{
+	for (int i = threadIdx.x; i < frameLength; i += blockDim.x)
+		src[i] ^= tgt[i];
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		int rem = codeLength % 8;
+		if (rem != 0)
+			src[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
+	}
+	__syncthreads();
+}
+
+__device__ int DevLeadingOne(const uint8_t* row, int codeLength)
+{
+	__shared__ int warpMin[THREADS_PER_BLOCK / 32];
+	int tid = threadIdx.x;
+	int local = INT_MAX;
+	int numBytes = (codeLength + 7) / 8;
+
+	for (int b = tid; b < numBytes; b += blockDim.x) {
+		uint8_t v = row[b];
+		if (b == numBytes - 1) {
+			int rem = codeLength % 8;
+			if (rem != 0)
+				v &= (uint8_t)((1u << rem) - 1u);
+		}
+		if (v != 0) {
+			for (int bit = 0; bit < 8; ++bit) {
+				int bitIndex = b * 8 + bit;
+				if (bitIndex >= codeLength) break;
+				if (v & (1 << bit)) {
+					local = min(local, bitIndex);
 					break;
 				}
 			}
-
-			// Проход по Cache, если в RAM не нашли
-			if (!found) {
-				for (size_t i = 0; i < wordsCount; ++i) {
-					if (rowType[i] == 1 && cwIndexFast[i] == rowIndex) {
-						selectedRowIndex = (int)i;
-						found = true;
-						break;
-					}
-				}
-			}
-
-			if (found) {
-				// Добавляем строку в итоговую матрицу
-				cudaMemcpy(d_matrix + matrixRows * frameLength,
-					d_fastRows + selectedRowIndex * frameLength,
-					frameLength, cudaMemcpyDeviceToDevice);
-
-				pivotsMatrix[matrixRows] = rowIndex;
-				cudaMemcpy(d_pivotsMatrix + matrixRows, &rowIndex, sizeof(int), cudaMemcpyHostToDevice);
-
-				matrixRows++;
-				rowType[selectedRowIndex] = -1; // Помечаем как отработанную (Dead)
-				break;
-			}
-
-			// ================================================================
-			// 2. ЕСЛИ ТОЧНОГО СОВПАДЕНИЯ НЕТ, ИЩЕМ СТРОКУ ДЛЯ РЕДУКЦИИ (pivot < rowIndex)
-			// Сначала проверяем RAM, затем Cache.
-			// ================================================================
-			int candidateRow = -1;
-
-			// Ищем в RAM строку, чей пивот уже «пройден» (< rowIndex)
-			for (size_t i = 0; i < wordsCount; ++i) {
-				if (rowType[i] == 0 && cwIndexFast[i] != -1 && cwIndexFast[i] < rowIndex) {
-					candidateRow = (int)i;
-					break;
-				}
-			}
-
-			// Если в RAM нет, ищем в Cache
-			if (candidateRow == -1) {
-				for (size_t i = 0; i < wordsCount; ++i) {
-					if (rowType[i] == 1 && cwIndexFast[i] != -1 && cwIndexFast[i] < rowIndex) {
-						candidateRow = (int)i;
-						break;
-					}
-				}
-			}
-
-			if (candidateRow != -1) {
-				int currentPivot = cwIndexFast[candidateRow];
-
-				// Ищем базовую строку в d_matrix с таким же пивотом
-				int init = INT_MAX;
-				cudaMemcpy(d_foundRow, &init, sizeof(int), cudaMemcpyHostToDevice);
-
-				int blocks = (int)((matrixRows + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-				if (blocks < 1) blocks = 1;
-
-				FindPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
-					d_pivotsMatrix, (int)matrixRows, currentPivot, d_foundRow);
-
-				int target_row;
-				cudaMemcpy(&target_row, d_foundRow, sizeof(int), cudaMemcpyDeviceToHost);
-
-				if (target_row != INT_MAX) {
-					// Делаем XOR
-					int blocksXor = (int)((frameLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-					if (blocksXor < 1) blocksXor = 1;
-
-					XorRowsKernel << <blocksXor, THREADS_PER_BLOCK >> > (
-						d_fastRows, d_matrix, (int)frameLength, candidateRow, target_row, (int)codeLength);
-
-					// Пересчитываем пивот
-					FindPivotInSingleRow << <1, THREADS_PER_BLOCK >> > (
-						d_fastRows + candidateRow * frameLength, (int)frameLength, d_pivotOut);
-
-					int newPivot;
-					cudaMemcpy(&newPivot, d_pivotOut, sizeof(int), cudaMemcpyDeviceToHost);
-
-					cwIndexFast[candidateRow] = newPivot;
-
-					// Если пивот стал -1, отключаем строку
-					if (newPivot == -1) {
-						rowType[candidateRow] = -1;
-					}
-					// Если пивот стал больше rowIndex, переводим строку в разряд Cache
-					else if (newPivot > rowIndex) {
-						rowType[candidateRow] = 1;
-					}
-
-					continue; // Рекурсивно повторяем поиск для текущего rowIndex
-				}
-			}
-
-			// ================================================================
-			// 3. ЕСЛИ ПИВОТ ОКАЗАЛСЯ СЛИШКОМ СПРАВА (pivot > rowIndex)
-			// Проверяем, есть ли в RAM свежие строки, которые опережают текущий rowIndex.
-			// Если есть — переводим их в кэш, чтобы они дождались своего часа.
-			// ================================================================
-			bool movedToCache = false;
-			for (size_t i = 0; i < wordsCount; ++i) {
-				if (rowType[i] == 0 && cwIndexFast[i] > rowIndex) {
-					rowType[i] = 1; // Переводим в кэш
-					movedToCache = true;
-				}
-			}
-
-			if (movedToCache) {
-				continue; // Пробуем снова найти совпадение для этого rowIndex
-			}
-
-			// ================================================================
-			// 4. НИЧЕГО НЕ ПОДОШЛО — ФОРМИРУЕМ НУЛЕВУЮ СТРОКУ
-			// ================================================================
-			memset(matrix[rowIndex], 0, frameLength);
-			pivotsMatrix[rowIndex] = -1;
-			matrixRows++;
-			int m1 = -1;
-			cudaMemcpy(d_pivotsMatrix + rowIndex, &m1, sizeof(int), cudaMemcpyHostToDevice);
-			break;
 		}
 	}
 
-	// Обратный ход Гаусса
-	ReverseGearGPU(d_matrix, matrixRows, frameLength, d_pivotsMatrix, (int)codeLength);
+	for (int off = 16; off > 0; off >>= 1)
+		local = min(local, __shfl_down_sync(0xFFFFFFFFu, local, off));
 
-	for (size_t i = 0; i < infoLength; ++i)
-		cudaMemcpy(matrix[i], d_matrix + i * frameLength, frameLength, cudaMemcpyDeviceToHost);
+	if ((tid & 31) == 0)
+		warpMin[tid >> 5] = local;
+	__syncthreads();
+
+	if (tid == 0) {
+		int best = INT_MAX;
+		for (int i = 0; i < (blockDim.x >> 5); ++i)
+			best = min(best, warpMin[i]);
+		warpMin[0] = best;
+	}
+	__syncthreads();
+
+	return (warpMin[0] == INT_MAX) ? -1 : warpMin[0];
+}
+
+__global__ void ProcessOneRowKernel(
+	int rowIndex,
+	uint8_t* d_fastRows,
+	uint8_t* d_matrix,
+	int* d_cwIndexFast,
+	int* d_rowType,
+	int* d_pivotsMatrix,
+	int* d_matrixRows,
+	int wordsCount,
+	int frameLength,
+	int codeLength)
+{
+	for (;;) {
+		// 1) pivot == rowIndex (сначала RAM=0, потом Cache=1)
+		int sel = DevFindExactType(d_cwIndexFast, d_rowType, wordsCount, rowIndex, 0);
+		if (sel == INT_MAX)
+			sel = DevFindExactType(d_cwIndexFast, d_rowType, wordsCount, rowIndex, 1);
+
+		if (sel != INT_MAX) {
+			int mrows = d_matrixRows[0];
+			uint8_t* dst = d_matrix + mrows * frameLength;
+			const uint8_t* src = d_fastRows + sel * frameLength;
+
+			for (int i = threadIdx.x; i < frameLength; i += blockDim.x)
+				dst[i] = src[i];
+			__syncthreads();
+
+			if (threadIdx.x == 0) {
+				int rem = codeLength % 8;
+				if (rem != 0)
+					dst[frameLength - 1] &= (uint8_t)((1u << rem) - 1u);
+
+				d_pivotsMatrix[mrows] = rowIndex;
+				d_matrixRows[0] = mrows + 1;
+				d_rowType[sel] = -1;
+			}
+			__syncthreads();
+			return;
+		}
+
+		// 2) редукция: pivot < rowIndex
+		int cand = DevFindLessType(d_cwIndexFast, d_rowType, wordsCount, rowIndex, 0);
+		if (cand == INT_MAX)
+			cand = DevFindLessType(d_cwIndexFast, d_rowType, wordsCount, rowIndex, 1);
+
+		if (cand != INT_MAX) {
+			int currentPivot = d_cwIndexFast[cand];
+			int mrows = d_matrixRows[0];
+
+			__shared__ int target;
+			if (threadIdx.x == 0) target = INT_MAX;
+			__syncthreads();
+
+			for (int i = threadIdx.x; i < mrows; i += blockDim.x) {
+				if (d_pivotsMatrix[i] == currentPivot)
+					atomicMin(&target, i);
+			}
+			__syncthreads();
+
+			if (target != INT_MAX) {
+				uint8_t* src = d_fastRows + cand * frameLength;
+				const uint8_t* tgt = d_matrix + target * frameLength;
+
+				DevXor(src, tgt, frameLength, codeLength);
+				int newPivot = DevLeadingOne(src, codeLength);
+
+				if (threadIdx.x == 0) {
+					d_cwIndexFast[cand] = newPivot;
+					if (newPivot == -1)
+						d_rowType[cand] = -1;
+					else if (newPivot > rowIndex)
+						d_rowType[cand] = 1;
+				}
+				__syncthreads();
+				continue;
+			}
+		}
+
+		// 3) RAM с pivot > rowIndex → Cache
+		__shared__ int moved;
+		if (threadIdx.x == 0) moved = 0;
+		__syncthreads();
+
+		for (int i = threadIdx.x; i < wordsCount; i += blockDim.x) {
+			if (d_rowType[i] == 0 && d_cwIndexFast[i] > rowIndex) {
+				d_rowType[i] = 1;
+				atomicExch(&moved, 1);
+			}
+		}
+		__syncthreads();
+
+		if (moved)
+			continue;
+
+		// 4) нулевая строка
+		{
+			int mrows = d_matrixRows[0];
+			uint8_t* dst = d_matrix + mrows * frameLength;
+
+			for (int i = threadIdx.x; i < frameLength; i += blockDim.x)
+				dst[i] = 0;
+			__syncthreads();
+
+			if (threadIdx.x == 0) {
+				d_pivotsMatrix[mrows] = -1;
+				d_matrixRows[0] = mrows + 1;
+			}
+			__syncthreads();
+			return;
+		}
+	}
 }
 
 // ============================================================================
@@ -388,8 +349,9 @@ void ProcessAllFrame(
 
 void WriteResultToFile(
 	const string& fileName,
-	uint8_t** matrix,
+	const uint8_t* h_matrix,
 	size_t matrixRows,
+	size_t frameLength,
 	size_t codeLength,
 	bool isBis)
 {
@@ -404,8 +366,9 @@ void WriteResultToFile(
 		uint8_t* buf = new uint8_t[totalBytes]();
 		size_t pos = 0;
 		for (size_t row = 0; row < matrixRows; ++row) {
+			const uint8_t* rowPtr = h_matrix + row * frameLength;
 			for (size_t b = 0; b < codeLength; ++b) {
-				if (GetBitHost(matrix[row], b))
+				if (GetBitHost(rowPtr, b))
 					buf[pos] = 0xFF;
 				++pos;
 			}
@@ -419,23 +382,18 @@ void WriteResultToFile(
 		uint8_t* buf = new uint8_t[totalBytes]();
 		size_t outBitPos = 0;
 		for (size_t row = 0; row < matrixRows; ++row) {
+			const uint8_t* rowPtr = h_matrix + row * frameLength;
 			for (size_t b = 0; b < codeLength; ++b) {
-				if (GetBitHost(matrix[row], b)) {
+				if (GetBitHost(rowPtr, b))
 					buf[outBitPos / 8] |= (1u << (outBitPos % 8));
-				}
 				++outBitPos;
 			}
 		}
 		out.write(reinterpret_cast<char*>(buf), totalBytes);
 		delete[] buf;
 	}
-
 	out.close();
 }
-
-// ============================================================================
-// MAIN
-// ============================================================================
 
 int main()
 {
@@ -443,8 +401,8 @@ int main()
 	auto start = chrono::high_resolution_clock::now();
 
 	// Параметры
-	const string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\6.21.bin)";
-	const string TempDir = R"(D:\Rubin\sessions\tmp_1783328386069\)";
+	const string InputFileName = "6.21.bin";
+	const string TempDir = "";
 
 	const size_t codeLength = 18004;
 	const size_t infoLength = 16384;
@@ -468,11 +426,6 @@ int main()
 
 	size_t totalBytes = wordsCount * frameLength;
 
-	// Матрица результата
-	uint8_t** matrix = new uint8_t*[infoLength];
-	for (size_t i = 0; i < infoLength; ++i)
-		matrix[i] = new uint8_t[frameLength]();
-
 	// Чтение входных данных
 	uint8_t* fileData = new uint8_t[fileSizeBytes];
 	file.read(reinterpret_cast<char*>(fileData), fileSizeBytes);
@@ -491,83 +444,89 @@ int main()
 	delete[] fileData;
 	fileData = nullptr;
 
-	// Индексы и типы строк
-	int* cwIndexFast = new int[wordsCount];
-	int* rowType = new int[wordsCount]; // 0 = RAM, 1 = Cache, -1 = Dead
-	for (size_t i = 0; i < wordsCount; ++i) {
-		cwIndexFast[i] = -1;
-		rowType[i] = 0; // Изначально все строки относятся к RAM
-	}
-
-	int* pivotsMatrix = new int[infoLength];
-	for (size_t i = 0; i < infoLength; ++i)
-		pivotsMatrix[i] = -1;
-
-	// GPU-память
 	uint8_t *d_fastRows = nullptr, *d_matrix = nullptr;
-	int *d_pivots = nullptr, *d_pivotsMatrix = nullptr;
-	int *d_foundRow = nullptr, *d_pivotOut = nullptr;
+	int *d_cwIndexFast = nullptr, *d_rowType = nullptr;
+	int *d_pivotsMatrix = nullptr, *d_matrixRows = nullptr;
+	int *d_pivots = nullptr;
 
 	cudaMalloc(&d_fastRows, totalBytes);
 	cudaMemcpy(d_fastRows, linearRows, totalBytes, cudaMemcpyHostToDevice);
-	cudaFreeHost(linearRows);
+	cudaFreeHost(linearRows);   // если выделяли cudaMallocHost
+	// если был new[] — delete[] linearRows;
 	linearRows = nullptr;
 
 	cudaMalloc(&d_matrix, infoLength * frameLength);
 	cudaMemset(d_matrix, 0, infoLength * frameLength);
 
+	cudaMalloc(&d_cwIndexFast, wordsCount * sizeof(int));
+	cudaMalloc(&d_rowType, wordsCount * sizeof(int));
+	cudaMalloc(&d_pivotsMatrix, infoLength * sizeof(int));
+	cudaMalloc(&d_matrixRows, sizeof(int));
 	cudaMalloc(&d_pivots, wordsCount * sizeof(int));
 
-	// Первичный поиск ведущих единиц
+	cudaMemset(d_rowType, 0, wordsCount * sizeof(int));           // все RAM
+	cudaMemset(d_pivotsMatrix, 0xFF, infoLength * sizeof(int));   // -1
+	cudaMemset(d_matrixRows, 0, sizeof(int));
+
+	// первичные пивоты → остаются на GPU
 	{
 		int warpsPerBlock = THREADS_PER_BLOCK / 32;
 		int blocks = (int)((wordsCount + warpsPerBlock - 1) / warpsPerBlock);
 		FindLeadingOneKernel << <blocks, THREADS_PER_BLOCK >> > (
 			d_fastRows, d_pivots, (int)frameLength, (int)wordsCount);
 		cudaDeviceSynchronize();
-		cudaMemcpy(cwIndexFast, d_pivots, wordsCount * sizeof(int), cudaMemcpyDeviceToHost);
+
+		cudaMemcpy(d_cwIndexFast, d_pivots, wordsCount * sizeof(int),
+			cudaMemcpyDeviceToDevice);
 		cudaFree(d_pivots);
 		d_pivots = nullptr;
 	}
 
-	cudaMalloc(&d_pivotsMatrix, infoLength * sizeof(int));
-	cudaMemcpy(d_pivotsMatrix, pivotsMatrix, infoLength * sizeof(int), cudaMemcpyHostToDevice);
+	for (int rowIndex = 0; rowIndex < (int)infoLength; ++rowIndex) {
+		ProcessOneRowKernel << <1, THREADS_PER_BLOCK >> > (
+			rowIndex,
+			d_fastRows,
+			d_matrix,
+			d_cwIndexFast,
+			d_rowType,
+			d_pivotsMatrix,
+			d_matrixRows,
+			(int)wordsCount,
+			(int)frameLength,
+			(int)codeLength);
+	}
+	cudaDeviceSynchronize();
 
-	cudaMalloc(&d_foundRow, sizeof(int));
-	cudaMalloc(&d_pivotOut, sizeof(int));
+	int matrixRows = 0;
+	cudaMemcpy(&matrixRows, d_matrixRows, sizeof(int), cudaMemcpyDeviceToHost);
 
-	// Гаусс
-	size_t matrixRows = 0;
+	if (matrixRows > 0) {
+		ReverseGearGPU(d_matrix, (size_t)matrixRows, frameLength,
+			d_pivotsMatrix, (int)codeLength);
+	}
 
-	ProcessAllFrame(
-		matrix,
-		d_fastRows, d_matrix,
-		wordsCount, codeLength, frameLength,
-		matrixRows, infoLength,
-		cwIndexFast, rowType, pivotsMatrix,
-		d_pivotsMatrix, d_foundRow, d_pivotOut);
+	uint8_t* h_matrix = new uint8_t[(size_t)matrixRows * frameLength]();
+	if (matrixRows > 0) {
+		cudaMemcpy(h_matrix, d_matrix,
+			(size_t)matrixRows * frameLength, cudaMemcpyDeviceToHost);
+	}
 
-	// Запись результата
 	string outName = TempDir + (dataType ? "result.bis" : "result.bin");
-	WriteResultToFile(outName, matrix, matrixRows, codeLength, dataType != 0);
+	WriteResultToFile(outName, h_matrix, (size_t)matrixRows, frameLength,
+		codeLength, dataType != 0);
 
-	// Очистка
-	for (size_t i = 0; i < infoLength; ++i)
-		delete[] matrix[i];
-	delete[] matrix;
-	delete[] cwIndexFast;
-	delete[] rowType;
-	delete[] pivotsMatrix;
+	delete[] h_matrix;
 
 	cudaFree(d_fastRows);
 	cudaFree(d_matrix);
+	cudaFree(d_cwIndexFast);
+	cudaFree(d_rowType);
 	cudaFree(d_pivotsMatrix);
-	cudaFree(d_foundRow);
-	cudaFree(d_pivotOut);
+	cudaFree(d_matrixRows);
 
 	auto ms = chrono::duration_cast<chrono::milliseconds>(
 		chrono::high_resolution_clock::now() - start).count();
-	cout << "Время выполнения программы в мс: " << ms << endl;
 
+	cout << "Время выполнения программы в мс: " << ms << endl;
 	return 0;
 }
