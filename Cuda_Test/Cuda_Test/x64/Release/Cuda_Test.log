@@ -1,0 +1,16 @@
+﻿  Compiling CUDA source file kernel.cu...
+  
+  C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin\nvcc.exe" -gencode=arch=compute_52,code=\"sm_52,compute_52\" --use-local-env -ccbin "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.16.27023\bin\HostX86\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\include"     --keep-dir x64\Release  -maxrregcount=0   --machine 64 --compile -cudart static    -DWIN32 -DWIN64 -DNDEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /O2 /FS   /MD " -Xcompiler "/Fdx64\Release\vc141.pdb" -o C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\x64\Release\kernel.cu.obj "C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\kernel.cu" 
+C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\kernel.cu(28): error : no instance of overloaded function "atomicOr" matches the argument list
+              argument types are: (uint8_t *, uint8_t)
+    		atomicOr(&d_fastRows[i * frameLength + (b / 8)], (uint8_t)(1u << (b % 8)));
+    		^
+  
+C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\kernel.cu(47): error : no instance of overloaded function "atomicOr" matches the argument list
+              argument types are: (uint8_t *, uint8_t)
+    		atomicOr(&d_fastRows[i * frameLength + (b / 8)], (uint8_t)(1u << (b % 8)));
+    		^
+  
+  2 errors detected in the compilation of "C:/Users/User/source/repos/Gaussian_Console_GPU/Cuda_Test/Cuda_Test/kernel.cu".
+  kernel.cu
+C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\Common7\IDE\VC\VCTargets\BuildCustomizations\CUDA 12.2.targets(799,9): error MSB3721: выход из команды ""C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin\nvcc.exe" -gencode=arch=compute_52,code=\"sm_52,compute_52\" --use-local-env -ccbin "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.16.27023\bin\HostX86\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\include"     --keep-dir x64\Release  -maxrregcount=0   --machine 64 --compile -cudart static    -DWIN32 -DWIN64 -DNDEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /O2 /FS   /MD " -Xcompiler "/Fdx64\Release\vc141.pdb" -o C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\x64\Release\kernel.cu.obj "C:\Users\User\source\repos\Gaussian_Console_GPU\Cuda_Test\Cuda_Test\kernel.cu"" с кодом "2".
